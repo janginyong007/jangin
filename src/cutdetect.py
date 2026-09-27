@@ -122,6 +122,8 @@ def find_repeated_phrases(
     max_gap_words: int = 4,
     fuzzy_threshold: float = 0.0,
     fuzzy_min_syllables: int = 4,
+    gap_min_words: int = 3,
+    gap_min_syllables: int = 6,
 ) -> List[Span]:
     """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
 
@@ -158,7 +160,12 @@ def find_repeated_phrases(
             ngram = norm[i:j]
             if not any(ngram):
                 continue
-            gap_range = range(0, max_gap_words + 1) if glen >= 2 else range(0, 1)
+            # 사이에 다른 말이 끼어있는 반복은 짧은 구절이면 인정하지 않는다.
+            # "이 건물은 튼튼합니다. 이 건물은 1990년에…"처럼 같은 말로 시작하는
+            # 서로 다른 문장에서 앞 문장의 "이 건물은"만 잘려나가는 일을 막기 위함.
+            allow_gap = (glen >= 2 and glen >= gap_min_words
+                         and len("".join(ngram)) >= gap_min_syllables)
+            gap_range = range(0, max_gap_words + 1) if allow_gap else range(0, 1)
             for gap in gap_range:
                 k = j + gap
                 m = k + glen
@@ -251,6 +258,8 @@ def detect_cuts(
         max_gap_words=cfg.get("repeat_max_gap_words", 4),
         fuzzy_threshold=cfg.get("repeat_fuzzy_threshold", 80),
         fuzzy_min_syllables=cfg.get("repeat_fuzzy_min_syllables", 4),
+        gap_min_words=cfg.get("repeat_gap_min_words", 3),
+        gap_min_syllables=cfg.get("repeat_gap_min_syllables", 6),
     )
     ai_spans = ai_spans or []
 

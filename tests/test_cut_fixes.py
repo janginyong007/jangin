@@ -29,8 +29,8 @@ def test_exact_repeat_still_works():
 
 def test_mispronounced_repeat_is_caught_only_with_fuzzy():
     ws = words_of("이 물건의 감종가는") + words_of("이 물건의 감정가는 삼억입니다", start=2.5)
-    # 기존 방식: 똑같은 '이 물건'까지만 컷하고 발음 꼬인 '감종가는'이 남음
-    assert find_repeated_phrases(ws, 5.0) == [(ws[0].start, ws[1].end)]
+    # 완전 일치만으로는 못 잡음 (예전엔 '이 물건'만 반쪽 컷하고 '감종가는'이 남았음)
+    assert find_repeated_phrases(ws, 5.0) == []
     spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
     assert spans == [(ws[0].start, ws[2].end)]             # 개선: 앞 테이크 전체 컷
 
@@ -123,3 +123,16 @@ def test_fuzzy_does_not_eat_preceding_word():
     ws = words_of("그래서 이 물건은 감종가가") + words_of("이 물건은 감정가가 삼억입니다", start=2.5)
     spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
     assert spans and spans[0][0] >= ws[1].start   # '그래서'는 살아남아야 함
+
+
+def test_same_opening_different_sentences_not_cut():
+    ws = words_of("이 건물은 튼튼합니다 이 건물은 1990년에 지어졌습니다")
+    assert find_repeated_phrases(ws, 5.0, fuzzy_threshold=80) == []
+
+
+def test_long_retake_with_new_intro_still_caught():
+    # 원래 프로그램이 잡던 사례: 같은 문장 앞에 짧은 도입구를 붙여 다시 말함
+    first = "29억 원대에 낙찰받는다고 계산하면 2.5%대입니다"
+    ws = words_of(first) + words_of("모텔 임대료는 " + first, start=5.0)
+    spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
+    assert spans == [(ws[0].start, ws[4].end)]  # 첫 문장 전체 컷, '모텔 임대료는'은 남김
