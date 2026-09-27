@@ -37,6 +37,9 @@ from .utils import (
 
 LogFn = Callable[[str], None]
 
+# 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
+VERSION = "2026-09-27 반복발화/말끝보호 수정판"
+
 
 def run_pipeline(
     media_path: str,
@@ -55,6 +58,7 @@ def run_pipeline(
     if not os.path.exists(media_path):
         raise PipelineError(f"파일을 찾을 수 없습니다: {media_path}")
 
+    log(f"[프로그램 버전] {VERSION}")
     log(f"[1/5] 파일 정보 확인: {media_path}")
     media = probe_video(media_path)
     if media.is_audio_only:
