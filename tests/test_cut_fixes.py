@@ -158,3 +158,29 @@ def test_report_includes_transcript(tmp_path):
     p = write_cut_report(str(tmp_path / "a.mp4"), "t", stats, words=ws, keep_spans=keeps)
     txt = open(p, encoding="utf-8-sig").read()
     assert "⟦고속도로 접근도가⟧" in txt and "고속도로 접근도가 좋습니다" in txt
+
+
+def test_fill_gaps_recovers_dropped_first_take(tmp_path, monkeypatch):
+    """위스퍼가 첫 테이크를 건너뛰었을 때, 빈 곳을 다시 받아적어 반복을 잡는지."""
+    import wave
+    from types import SimpleNamespace as NS
+    from src import transcribe as T
+    x = _speech([(0.5, 1.5, 0.1), (3.5, 1.8, 0.1)], 6.0)   # 두 번 말함
+    wav = tmp_path / "a.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+        w.writeframes((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes())
+    # 위스퍼 1차 결과: 두 번째 테이크만 적힘
+    words = [Word(" 고속도로", 3.5, 4.1), Word(" 접근도", 4.1, 4.6), Word(" 편합니다", 4.6, 5.3)]
+
+    class FakeModel:
+        def transcribe(self, path, **kw):
+            seg = NS(no_speech_prob=0.1, avg_logprob=-0.3, words=[
+                NS(word=" 고속도로", start=0.15, end=0.7), NS(word=" 접근도", start=0.7, end=1.2),
+                NS(word=" 편합니", start=1.2, end=1.7)])
+            return [seg], None
+    monkeypatch.setattr(T, "_extract_subclip", lambda *a, **k: None)
+    out = T._fill_transcript_gaps(words, str(wav), FakeModel(), "ko", str(tmp_path))
+    assert [w.text.strip() for w in out][:3] == ["고속도로", "접근도", "편합니"]
+    spans = find_repeated_phrases(out, 5.0, fuzzy_threshold=80)
+    assert spans and spans[0][0] < 1.0 and spans[0][1] < 3.0   # 앞 테이크만 컷

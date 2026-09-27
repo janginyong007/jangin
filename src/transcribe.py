@@ -143,7 +143,7 @@ def _refine_long_words(words: List[Word], wav_path: str, model: "WhisperModel", 
 
 
 # 전사 방식이 바뀌면 올려서 예전 캐시(반복이 합쳐진 결과)를 다시 쓰지 않게 한다.
-_TRANSCRIBE_VERSION = "verbatim-2"
+_TRANSCRIBE_VERSION = "verbatim-3"
 
 # 위스퍼는 앞 문맥을 보고 말을 매끄럽게 '정리'해서, 두 번 반복한 말을 한 번으로
 # 합쳐 받아적는 경향이 있다 (그러면 텍스트에 반복이 안 남아 반복 감지가 불가능).
@@ -151,6 +151,57 @@ _TRANSCRIBE_VERSION = "verbatim-2"
 # 주의: 예시에 "이 물건은, 이 물건은" 같은 반복을 넣었더니 한 번 말한 "2013년"을
 # 여러 번 받아적는 오류가 생겨서(verbatim-1), 반복 없이 간투사만 넣는다.
 VERBATIM_PROMPT = "음, 그러니까, 어, 이 물건은 감정가가 삼억 원이고요, 음, 최저가는"
+
+
+def _fill_transcript_gaps(words: List[Word], wav_path: str, model, language: str, cache_dir: str,
+                          min_len: float = 0.4) -> List[Word]:
+    """받아쓰기 사이의 '빈 곳'에 실제 말소리가 있으면 그 부분만 다시 받아적는다.
+
+    위스퍼는 말끝을 흐리다 멈춘 첫 테이크("고속도로 접근도 편합니…")를 통째로
+    건너뛰고 다시 말한 두 번째 테이크만 적는 경우가 많다. 그러면 텍스트에 반복이
+    안 남아서 반복 감지가 불가능하다. 그 구간만 따로 잘라 다시 인식하면 대부분
+    받아적히고, 이후 반복 감지가 앞 테이크를 잡아낸다."""
+    if not words:
+        return words
+    from .audio_energy import load_energy, loud_regions
+
+    en = load_energy(wav_path)
+    total = len(en.db) * 0.01
+    bounds = [(0.0, words[0].start)] + [(a.end, b.start) for a, b in zip(words, words[1:])]
+    bounds.append((words[-1].end, total))
+    holes = []
+    for gs, ge in bounds:
+        if ge - gs >= min_len:
+            holes.extend(loud_regions(en, gs + 0.05, ge - 0.05, min_len=min_len))
+    if not holes:
+        return words
+
+    print(f"[transcribe] 받아쓰기에서 빠진 말소리 {len(holes)}곳 발견, 다시 인식 중...")
+    added: List[Word] = []
+    for rs, re_ in holes:
+        sub_start, sub_end = max(0.0, rs - 0.15), re_ + 0.25
+        sub_path = os.path.join(cache_dir, f"_gap_{sub_start:.2f}_{sub_end:.2f}.wav")
+        try:
+            _extract_subclip(wav_path, sub_start, sub_end, sub_path)
+            segs, _info = model.transcribe(sub_path, language=language, word_timestamps=True,
+                                           vad_filter=False, condition_on_previous_text=False)
+            for seg in segs:
+                # 숨소리/잡음을 말로 지어내는 것(환각)을 막기 위한 거르기
+                if getattr(seg, "no_speech_prob", 0.0) > 0.6 or getattr(seg, "avg_logprob", 0.0) < -1.0:
+                    continue
+                for sw in seg.words or []:
+                    text = sw.word.rstrip()
+                    ws, we = sub_start + sw.start, sub_start + sw.end
+                    if text.strip() and rs - 0.3 <= ws and we <= re_ + 0.4:
+                        added.append(Word(text=text, start=ws, end=we))
+        except Exception as e:  # noqa: BLE001 - 실패해도 원래 결과로 진행
+            print(f"[transcribe] 빈 곳 재인식 실패({rs:.1f}초): {e}")
+        finally:
+            if os.path.exists(sub_path):
+                os.remove(sub_path)
+    if added:
+        print(f"[transcribe]   빠졌던 단어 {len(added)}개 추가")
+    return sorted(words + added, key=lambda w: w.start)
 
 
 def _cache_path(cache_dir: str, video_path: str, model_name: str, verbatim: bool = True) -> str:
@@ -229,6 +280,8 @@ def transcribe(video_path: str, cache_dir: str, whisper_cfg: dict) -> List[Word]
             words.append(Word(text=text, start=w.start, end=w.end))
 
     words = _refine_long_words(words, wav_path, model, language, cache_dir)
+    if whisper_cfg.get("fill_gaps", True):
+        words = _fill_transcript_gaps(words, wav_path, model, language, cache_dir)
 
     with open(cache_file, "w", encoding="utf-8") as f:
         json.dump([asdict(w) for w in words], f, ensure_ascii=False, indent=2)
