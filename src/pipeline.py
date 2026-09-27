@@ -38,7 +38,7 @@ from .utils import (
 LogFn = Callable[[str], None]
 
 # 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
-VERSION = "2026-09-27 수정판 7 (고속도로 재시도/지어낸 말 제거)"
+VERSION = "2026-09-27 수정판 8 (실제 녹음으로 검증)"
 
 
 def run_pipeline(
@@ -142,6 +142,8 @@ def run_pipeline(
         }
 
     if apply_cuts:
+        # 뒤 테이크 앞부분이 받아쓰기에서 빠진 곳은 단어를 제자리로 옮긴 목록으로 자막을 만든다
+        words = stats.get("subtitle_words", words)
         report_path = write_cut_report(media_path, draft_name, stats, words=words, keep_spans=keep_spans)
         log(f"      컷 리포트(무엇을 왜 잘랐는지): {report_path}")
 

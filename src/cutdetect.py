@@ -262,50 +262,87 @@ def _retake_follows(words: List[Word], span: Span, threshold: float, lookahead: 
     return False
 
 
-def retake_start_in_hole(words: List[Word], pairs, energy: "Energy",
-                         min_hole: float = 0.4, max_pause: float = 0.35) -> List[Span]:
-    """반복 뒤쪽 테이크 바로 앞에 '받아적지 못한 말소리'가 있으면, 그 말소리는 다시 말한
-    테이크의 앞부분일 가능성이 높다. 그만큼 앞 테이크도 더 앞에서부터 잘라야 한다.
+def retake_start_in_hole(words: List[Word], pairs, energy: "Energy", moves: Optional[list] = None) -> List[Span]:
+    """뒤 테이크의 앞부분이 받아쓰기에서 빠진 경우, 앞 테이크를 통째로 자르기 위한 추가 구간.
 
-    실제 사례: "고속도로 접근도 편합니… / (고속도로 접근도: 받아쓰기 누락) 편합니다"
-    -> "편합니다"끼리만 반복으로 잡혀서 앞 테이크의 "고속도로 접근도"가 남고 반복이 들림.
-    빈 곳의 말소리 길이와 가장 비슷한 만큼 앞 테이크 쪽 단어를 거슬러 올라가 자른다."""
-    from .audio_energy import loud_regions, soft_speech_level
+    실제 사례(0927 녹음 1분 40초):
+      "지척이라 / 고속도로 접근도 편합니… / (쉼) / 고속도로 접근도 편합니다"
+      위스퍼는 뒤 테이크의 "고속도로 접근도"를 빼먹고 "편합니다. 편합니다."만 적었다.
+      -> "편합니다."끼리만 반복으로 잡혀 앞 테이크의 "고속도로 접근도"가 남았다.
+
+    위스퍼 단어 시각은 부정확해서(앞 "고속도로"가 "지척이라" 꼬리부터 찍힘) 소리로 판단한다:
+      1) 앞 테이크(A)가 끝난 뒤 '쉼'이 있고, 그 뒤 말소리가 뒤 테이크(B)까지 쉼 없이 이어진다
+         (= B 앞에 받아적지 못한 말이 붙어 있다)
+      2) 앞 테이크 쪽도 A에서 거꾸로 쉼이 나올 때까지를 한 덩어리로 본다
+      3) 두 덩어리 길이가 비슷하면(0.6~1.6배) 앞 덩어리 전체를 다시 말한 것으로 보고 자른다
+    쉼 없이 이어지는 경우(위스퍼가 A의 시각만 일찍 찍은 경우)는 해당 없음."""
+    from .audio_energy import next_run_start, run_end_after, run_start_before
 
     extra: List[Span] = []
     for i, j, k in pairs:
-        if k != j or i == 0:
+        if k != j:
             continue  # 두 테이크 사이에 받아적힌 말이 있으면 해당 없음
-        gs, ge = words[j - 1].end, words[k].start
-        regs = loud_regions(energy, gs + 0.05, ge + 0.05, min_len=0.25, level=soft_speech_level(energy))
-        if not regs:
-            continue
-        hs, he = regs[0][0], regs[-1][1]
-        if he < ge - 0.4 or he - hs < min_hole:
-            continue  # 뒤 테이크 바로 앞에 붙어있는 말소리만
-        hole = he - hs
-        # 앞 테이크 시작(words[i]) 이전 단어들을 쉼 없이 이어진 만큼 거슬러 올라가며
-        # 누적 길이가 빈 곳 길이와 가장 비슷한 지점을 찾는다 (같으면 적게 자르는 쪽)
-        best_c, best_diff, acc = 0, hole, 0.0
-        x = i
-        def continuous(a: Word, b: Word) -> bool:
-            # 위스퍼 단어 시각은 부정확하니, 두 단어 사이가 실제로 조용했는지 소리로 판단
-            if b.start - a.end <= max_pause:
-                return True
-            fa, fb = energy.frame(a.end), energy.frame(b.start)
-            seg = energy.db[fa:fb]
-            return len(seg) > 0 and float((seg >= energy.speech_off).mean()) >= 0.6
-
-        while x > 0 and continuous(words[x - 1], words[x]):
-            x -= 1
-            acc += words[x].end - words[x].start  # 단어 사이 쉼은 빼고 말한 길이만
-            if acc > hole * 1.5:
+        glen = j - i
+        a_end = run_end_after(energy, words[j - 1].end - 0.05, max_fwd=1.0)
+        r_start = next_run_start(energy, a_end, words[k].start)
+        # 숨소리/입소리 같은 아주 짧은 소리(0.25초 미만)는 건너뛴다
+        while r_start < words[k].start - 0.3:
+            r_run_end = run_end_after(energy, r_start, max_fwd=words[k].start - r_start + 0.05)
+            if r_run_end - r_start >= 0.25:
                 break
-            if abs(acc - hole) < best_diff - 0.05:
-                best_c, best_diff = i - x, abs(acc - hole)
-        if best_c and best_diff <= hole * 0.5:
-            extra.append((words[i - best_c].start, words[i].start))
+            r_start = next_run_start(energy, r_run_end, words[k].start)
+        if r_start >= words[k].start - 0.3:
+            continue  # B 앞에 받아적지 못한 말이 (충분히) 없음
+        # r_start부터 B 시작까지 쉼 없이 이어져야 B 테이크의 앞부분
+        if run_end_after(energy, r_start, max_fwd=words[k].start - r_start + 0.05) < words[k].start - 0.1:
+            continue
+        r_end = run_end_after(energy, words[k + glen - 1].end - 0.05, max_fwd=1.5)
+        f_start = run_start_before(energy, words[i].start + 0.05)
+        if f_start >= words[i].start - 0.1:
+            continue  # 앞 테이크 쪽에 더 자를 게 없음
+        f_len, r_len = a_end - f_start, r_end - r_start
+        if r_len <= 0 or not (0.6 <= f_len / r_len <= 1.6):
+            continue
+        extra.append((f_start, words[i].start))
+        if moves is not None:
+            # 자막용: 앞 테이크에서 받아적힌 단어들(=뒤 테이크 누락분과 같은 말)을 뒤 테이크 자리로 옮긴다
+            idx = [x for x in range(i) if words[x].end > f_start + 0.1 and words[x].start < words[i].start]
+            if idx:
+                src0, src1 = words[idx[0]].start, words[i].start
+                dst0, dst1 = r_start, words[k].start
+                scale = (dst1 - dst0) / max(src1 - src0, 1e-3)
+                moves.extend((x, dst0 + (words[x].start - src0) * scale,
+                              dst0 + (words[x].end - src0) * scale) for x in idx)
     return extra
+
+
+def _extend_to_sound_edges(spans: List[Span], words: List[Word], energy: "Energy") -> List[Span]:
+    """말 컷(반복/필러/AI)의 경계를 실제 소리 끝까지 넓힌다. 위스퍼가 단어 끝을 일찍
+    찍어서, 잘라낸 테이크의 꼬리("편합니…"의 "…니")가 0.2초쯤 남는 문제 방지.
+    옆 단어(남기는 말)를 침범하지 않는 범위에서만 넓힌다."""
+    from .audio_energy import run_end_after, run_start_before
+
+    out = []
+    for s, e in spans:
+        nxt = min((w.start for w in words if w.start >= e - 0.01), default=e + 1.0)
+        prv = max((w.end for w in words if w.end <= s + 0.01), default=s - 1.0)
+        e2 = run_end_after(energy, e - 0.05, max_fwd=0.6)
+        if e < e2 < nxt - 0.1:
+            e = e2
+        s2 = run_start_before(energy, s + 0.05, max_back=0.6)
+        if prv + 0.1 < s2 < s:
+            s = s2
+        out.append((s, e))
+    return out
+
+
+def _apply_moves(words: List[Word], moves) -> List[Word]:
+    if not moves:
+        return words
+    moved = {x: (s, e) for x, s, e in moves}
+    out = [Word(text=w.text, start=moved[x][0], end=moved[x][1]) if x in moved else w
+           for x, w in enumerate(words)]
+    return sorted(out, key=lambda w: w.start)
 
 
 def untranscribed_speech(words: List[Word], energy: "Energy", total: float, min_len: float = 0.4) -> List[Span]:
@@ -328,6 +365,7 @@ def collapse_phantom_repeats(words: List[Word], max_rate: float = 10.0) -> List[
     """위스퍼가 한 번 말한 단어를 여러 번 받아적은 것("2013년 2013년"을 1초 안에)을
     하나로 합친다. 소리는 이미 안 자르지만(반복 감지의 속도 검사), 자막에 두 번
     나오는 문제가 있어서 단어 목록 자체를 정리한다."""
+    words = [w for w in words if w.end - w.start >= 0.02]  # 길이 0인 단어는 지어낸 것
     out: List[Word] = []
     i, n = 0, len(words)
     while i < n:
@@ -340,6 +378,25 @@ def collapse_phantom_repeats(words: List[Word], max_rate: float = 10.0) -> List[
         else:
             out.extend(words[i:j])
         i = j
+    return _drop_overlapping_alternatives(out)
+
+
+def _drop_overlapping_alternatives(words: List[Word]) -> List[Word]:
+    """위스퍼가 같은 순간에 비슷한 단어 두 개를 겹쳐 적은 것("것으로 것을", "들어가 들어와",
+    "임차권 임차" - 시각이 거의 겹침)은 한 번 말한 것이므로 더 길게 잡힌 쪽 하나만 남긴다."""
+    out: List[Word] = []
+    for w in words:
+        if out:
+            p = out[-1]
+            ov = min(p.end, w.end) - max(p.start, w.start)
+            short = min(p.end - p.start, w.end - w.start)
+            kp, kw = normalize(p.text), normalize(w.text)
+            # 똑같은 단어가 겹친 건 진짜 버벅임일 수 있어(반복 감지가 잘라야 함) 건드리지 않는다
+            if short > 0 and ov >= 0.5 * short and kp and kw and kp != kw and kp[0] == kw[0]:
+                if (w.end - w.start) > (p.end - p.start):
+                    out[-1] = w
+                continue
+        out.append(w)
     return out
 
 
@@ -412,8 +469,9 @@ def detect_cuts(
         pairs_out=pairs,
     )
     hole_spans: List[Span] = []
+    moves: list = []
     if energy is not None and cfg.get("retake_hole_extend", True):
-        hole_spans = retake_start_in_hole(words, pairs, energy)
+        hole_spans = retake_start_in_hole(words, pairs, energy, moves)
     # AI 검토 컷 안전장치: AI가 '앞선 시도'라며 지우려는 말이 바로 뒤(남는 쪽)에
     # 실제로 비슷하게 다시 나오지 않으면 지우지 않는다. AI가 남겨야 할 마지막
     # 테이크까지 지워서 문장이 끊긴 사례가 있었음
@@ -448,8 +506,19 @@ def detect_cuts(
             head_margin=cfg.get("energy_head_margin", 0.08),
         )
         content_padded = snap_content_spans(content_padded, energy)
+        content_padded = _extend_to_sound_edges(content_padded, words, energy)
     merged = merge_spans(silence_padded + content_padded)
     keep_spans = compute_keep_spans(merged, total_duration, cfg["min_keep_duration"])
+    if energy is not None and cfg.get("energy_refine", True):
+        # 말이 하나도 없는 짧은 조각(입소리/숨소리만 남은 0.3~1초짜리)은 버린다
+        from .audio_energy import loud_regions, soft_speech_level
+
+        def has_speech(s: float, e: float) -> bool:
+            if any(s <= (w.start + w.end) / 2 <= e for w in words):
+                return True
+            return bool(loud_regions(energy, s, e, min_len=0.25, level=soft_speech_level(energy)))
+
+        keep_spans = [(s, e) for s, e in keep_spans if e - s >= 1.0 or has_speech(s, e)]
 
     total_cut = total_duration - sum(e - s for s, e in keep_spans)
     stats = {
@@ -466,6 +535,8 @@ def detect_cuts(
         "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans),
         "ai_spans_rejected": len(ai_spans_in) - len(ai_spans),
         "untranscribed": untranscribed_speech(words, energy, total_duration) if energy is not None else [],
+        # 자막/리포트용 단어 목록 (뒤 테이크 누락분을 제자리로 옮긴 것)
+        "subtitle_words": _apply_moves(words, moves),
     }
     return keep_spans, stats
 

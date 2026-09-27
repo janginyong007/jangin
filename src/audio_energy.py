@@ -130,18 +130,38 @@ def loud_regions(en: Energy, t0: float, t1: float, min_len: float = 0.25,
     """[t0, t1] 안에서 말소리로 보이는 구간들 (level 이상이 한 번이라도 있고,
     speech_off 이상이 min_len초 이상 이어지는 곳). level 기본값은 speech_on."""
     lvl = en.speech_on if level is None else level
+    max_dip = int(0.1 / HOP)
     a, b = en.frame(t0), en.frame(t1)
     regions = []
     i = a
     while i < b:
         if en.db[i] >= lvl:
+            # 음절 사이의 아주 짧은 끊김(0.1초 이하)은 같은 말로 이어 본다
+            # (실제로 "고|속도로" 사이 0.03초 끊김 때문에 "고"가 잘려나간 사례)
             j = i
-            while j < b and en.db[j] >= en.speech_off:
-                j += 1
-            # 앞쪽 약한 첫소리까지 포함
+            while j < b:
+                if en.db[j] >= en.speech_off:
+                    j += 1
+                    continue
+                d = j
+                while d < b and d - j <= max_dip and en.db[d] < en.speech_off:
+                    d += 1
+                if d < b and d - j <= max_dip and en.db[d] >= en.speech_off:
+                    j = d
+                    continue
+                break
             k = i
-            while k > a and en.db[k - 1] >= en.speech_off:
-                k -= 1
+            while k > a:
+                if en.db[k - 1] >= en.speech_off:
+                    k -= 1
+                    continue
+                d = k - 1
+                while d > a and (k - 1) - d < max_dip and en.db[d] < en.speech_off:
+                    d -= 1
+                if d >= a and (k - 1) - d < max_dip and en.db[d] >= en.speech_off:
+                    k = d
+                    continue
+                break
             if (j - k) * HOP >= min_len:
                 regions.append((en.time(k), en.time(j)))
             i = j
@@ -182,3 +202,46 @@ def snap_content_spans(spans: List[Span], en: Energy, window: float = 0.12) -> L
         if ne > ns:
             out.append((ns, ne))
     return out
+
+
+def _is_quiet(en: Energy, i: int) -> bool:
+    # 쉼 판정은 말끝 기준(speech_off)보다 조금 높게: 잔향/숨소리도 쉼으로 본다
+    return en.db[i] < en.speech_off + 3.0
+
+
+def run_start_before(en: Energy, t: float, max_back: float = 8.0, min_pause: float = 0.25) -> float:
+    """t에서 거꾸로 가며 min_pause 이상 조용한 곳을 찾아, 그 직후(말 덩어리 시작) 시각."""
+    i, lim = en.frame(t), en.frame(max(0.0, t - max_back))
+    need, quiet = int(min_pause / HOP), 0
+    while i > lim:
+        i -= 1
+        if _is_quiet(en, i):
+            quiet += 1
+            if quiet >= need:
+                return en.time(i + quiet)
+        else:
+            quiet = 0
+    return en.time(lim)
+
+
+def run_end_after(en: Energy, t: float, max_fwd: float = 3.0, min_pause: float = 0.25) -> float:
+    """t부터 앞으로 가며 min_pause 이상 조용해지기 시작하는 시각 (말 덩어리 끝)."""
+    i, lim = en.frame(t), en.frame(t + max_fwd)
+    need, quiet = int(min_pause / HOP), 0
+    while i < lim:
+        if _is_quiet(en, i):
+            quiet += 1
+            if quiet >= need:
+                return en.time(i - quiet + 1)
+        else:
+            quiet = 0
+        i += 1
+    return en.time(lim)
+
+
+def next_run_start(en: Energy, t: float, limit: float) -> float:
+    """t 이후 처음으로 말소리(쉼 기준 이상)가 시작되는 시각. 없으면 limit."""
+    i, lim = en.frame(t), en.frame(limit)
+    while i < lim and _is_quiet(en, i):
+        i += 1
+    return en.time(i)
