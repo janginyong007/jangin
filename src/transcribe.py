@@ -143,12 +143,14 @@ def _refine_long_words(words: List[Word], wav_path: str, model: "WhisperModel", 
 
 
 # 전사 방식이 바뀌면 올려서 예전 캐시(반복이 합쳐진 결과)를 다시 쓰지 않게 한다.
-_TRANSCRIBE_VERSION = "verbatim-1"
+_TRANSCRIBE_VERSION = "verbatim-2"
 
 # 위스퍼는 앞 문맥을 보고 말을 매끄럽게 '정리'해서, 두 번 반복한 말을 한 번으로
 # 합쳐 받아적는 경향이 있다 (그러면 텍스트에 반복이 안 남아 반복 감지가 불가능).
-# 말더듬/반복이 그대로 적힌 예시를 프롬프트로 주면 그 문체를 따라 그대로 받아적는다.
-VERBATIM_PROMPT = "음, 그, 이 물건은, 이 물건은 감정가가, 감정가가 삼억, 어, 그러니까 그러니까 말씀드리면"
+# 간투사가 그대로 적힌 예시를 프롬프트로 주면 그 문체를 따라 들리는 대로 받아적는다.
+# 주의: 예시에 "이 물건은, 이 물건은" 같은 반복을 넣었더니 한 번 말한 "2013년"을
+# 여러 번 받아적는 오류가 생겨서(verbatim-1), 반복 없이 간투사만 넣는다.
+VERBATIM_PROMPT = "음, 그러니까, 어, 이 물건은 감정가가 삼억 원이고요, 음, 최저가는"
 
 
 def _cache_path(cache_dir: str, video_path: str, model_name: str, verbatim: bool = True) -> str:

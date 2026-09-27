@@ -78,6 +78,24 @@ def _is_fuzzy_repeat(first: str, second: str, threshold: float, min_syllables: i
     return best >= threshold
 
 
+def _spoken_syllables(text: str) -> float:
+    """말로 읽을 때 대략 몇 음절인지. 숫자는 한 자리당 약 1.5음절로 본다
+    ("2013년" -> 이천십삼년, 약 7음절)."""
+    hangul = sum(1 for ch in text if "가" <= ch <= "힣")
+    digits = sum(len(d) for d in _DIGITS_RE.findall(text))
+    return hangul + digits * 1.5
+
+
+def _plausible_rate(ws: List[Word], max_rate: float) -> bool:
+    """이 단어들을 그 시간 안에 사람이 실제로 말할 수 있는 속도인지.
+    위스퍼가 한 번 말한 걸 여러 번 받아적는 오류를 내면("2013년 2013년 2013년"을
+    1초 안에) 가짜 반복들이 비현실적으로 짧은 시간에 몰린다. 그걸 진짜
+    반복으로 믿고 자르면 실제로 말한 부분이 잘려나간다."""
+    dur = ws[-1].end - ws[0].start
+    syl = _spoken_syllables("".join(w.text for w in ws))
+    return dur > 0 and syl / dur <= max_rate
+
+
 def _word_similar(ja: str, jb: str, threshold: float) -> bool:
     if not ja or not jb or ja[0] != jb[0]:
         return False
@@ -124,6 +142,7 @@ def find_repeated_phrases(
     fuzzy_min_syllables: int = 4,
     gap_min_words: int = 3,
     gap_min_syllables: int = 6,
+    max_syllable_rate: float = 10.0,
 ) -> List[Span]:
     """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
 
@@ -185,6 +204,10 @@ def find_repeated_phrases(
                         "".join(ngram), "".join(norm[k:min(n, m + 1)]),
                         fuzzy_threshold, fuzzy_min_syllables,
                     )
+                if same and max_syllable_rate > 0 and not (
+                        _plausible_rate(words[i:j], max_syllable_rate)
+                        and _plausible_rate(words[k:m], max_syllable_rate)):
+                    same = False  # 사람이 낼 수 없는 속도 -> 인식 오류로 보고 자르지 않음
                 if same:
                     spans.append((words[i].start, words[j - 1].end))
                     i = k
@@ -260,6 +283,7 @@ def detect_cuts(
         fuzzy_min_syllables=cfg.get("repeat_fuzzy_min_syllables", 4),
         gap_min_words=cfg.get("repeat_gap_min_words", 3),
         gap_min_syllables=cfg.get("repeat_gap_min_syllables", 6),
+        max_syllable_rate=cfg.get("repeat_max_syllable_rate", 10.0),
     )
     ai_spans = ai_spans or []
 

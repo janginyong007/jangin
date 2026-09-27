@@ -133,6 +133,19 @@ def test_same_opening_different_sentences_not_cut():
 def test_long_retake_with_new_intro_still_caught():
     # 원래 프로그램이 잡던 사례: 같은 문장 앞에 짧은 도입구를 붙여 다시 말함
     first = "29억 원대에 낙찰받는다고 계산하면 2.5%대입니다"
-    ws = words_of(first) + words_of("모텔 임대료는 " + first, start=5.0)
+    ws = words_of(first, dur=0.7) + words_of("모텔 임대료는 " + first, start=5.0, dur=0.7)
     spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
     assert spans == [(ws[0].start, ws[4].end)]  # 첫 문장 전체 컷, '모텔 임대료는'은 남김
+
+
+def test_whisper_phantom_repeat_not_cut():
+    # 실제로는 '2013년'을 한 번 말했는데 위스퍼가 1초 안에 세 번 받아적은 경우
+    ws = [Word("2013년", 80.59, 81.08), Word("2013년", 81.08, 81.57), Word("2013년", 81.57, 81.7),
+          Word("대전도시공사가", 81.7, 82.5)]
+    assert find_repeated_phrases(ws, 5.0, fuzzy_threshold=80) == []
+
+
+def test_real_quick_repeat_still_cut():
+    # 실제로 '7월에, 7월에' 라고 다시 말한 경우 (정상 속도)
+    ws = [Word("7월에", 290.65, 291.1), Word("7월에", 291.5, 291.95), Word("입찰", 292.0, 292.4)]
+    assert find_repeated_phrases(ws, 5.0) == [(290.65, 291.1)]
