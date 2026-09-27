@@ -20,7 +20,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 
 from .audio_energy import load_energy
 from .build_draft import build_draft
-from .cutdetect import detect_cuts
+from .cutdetect import collapse_phantom_repeats, detect_cuts
 from .disfluency import review_cut_script
 from .render_audio import render_audio
 from .subtitles import build_subtitles
@@ -38,7 +38,7 @@ from .utils import (
 LogFn = Callable[[str], None]
 
 # 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
-VERSION = "2026-09-27 수정판 5 (고속도로/보증금/7월에 수정)"
+VERSION = "2026-09-27 수정판 6 (작은 목소리 재시도 잡기)"
 
 
 def run_pipeline(
@@ -70,6 +70,10 @@ def run_pipeline(
     t0 = time.time()
     words = transcribe(media_path, cache_dir, cfg["whisper"])
     log(f"      완료 ({time.time() - t0:.1f}초, 단어 {len(words)}개 인식)")
+    n_before = len(words)
+    words = collapse_phantom_repeats(words, cfg.get("cut", {}).get("repeat_max_syllable_rate", 10.0))
+    if len(words) < n_before:
+        log(f"      음성 인식이 중복으로 적은 단어 {n_before - len(words)}개 정리 (예: '2013년 2013년')")
 
     if apply_cuts:
         log("[3/5] 무음/필러/반복발화 컷 구간 감지...")

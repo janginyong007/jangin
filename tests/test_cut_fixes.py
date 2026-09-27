@@ -207,3 +207,25 @@ def test_ai_span_kept_when_retake_follows():
           + words_of("각 방에 취사 시설 설치 여부가 대장 용도와 맞는지는 확인해 볼 대목입니다", start=153.0))
     _, st = detect_cuts(ws, 300.0, dict(CFG, repeat_window=5.0), ai_spans=[(139.0, 143.0)])
     assert st["ai_spans"] == 1
+
+
+def test_collapse_phantom_repeats_for_subtitles():
+    from src.cutdetect import collapse_phantom_repeats
+    ws = [Word("2013년", 80.59, 81.08), Word("2013년", 81.08, 81.57), Word("대전도시공사가", 81.7, 82.5)]
+    out = collapse_phantom_repeats(ws)
+    assert [w.text for w in out] == ["2013년", "대전도시공사가"] and out[0].end == 81.57
+    real = [Word("7월에", 290.65, 291.1), Word("7월에", 291.5, 291.95)]
+    assert len(collapse_phantom_repeats(real)) == 2   # 실제 반복은 그대로
+
+
+def test_soft_second_take_is_found_as_hole():
+    from src.cutdetect import untranscribed_speech
+    # 첫 테이크는 크게, 두 번째 테이크(받아쓰기 누락)는 작게
+    x = _speech([(0.5, 1.5, 0.1)], 6.0)
+    t = np.arange(int(1.5 * SR)) / SR
+    x[int(2.6 * SR):int(2.6 * SR) + len(t)] += 0.006 * np.sin(2 * np.pi * 220 * t)   # 작은 목소리
+    x[int(4.5 * SR):int(5.2 * SR)] += 0.3 * np.sin(2 * np.pi * 220 * np.arange(int(0.7 * SR)) / SR)
+    en = energy_from_samples(x, SR)
+    ws = [Word("고속도로", 0.5, 1.2), Word("접근도", 1.2, 2.0), Word("편합니다", 4.5, 5.2)]
+    holes = untranscribed_speech(ws, en, 6.0)
+    assert any(s <= 3.0 <= e for s, e in holes)

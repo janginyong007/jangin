@@ -259,7 +259,7 @@ def _retake_follows(words: List[Word], span: Span, threshold: float, lookahead: 
 
 def untranscribed_speech(words: List[Word], energy: "Energy", total: float, min_len: float = 0.4) -> List[Span]:
     """받아쓰기에 없는데 실제로는 말소리가 있는 구간 (리포트 표시용)."""
-    from .audio_energy import loud_regions
+    from .audio_energy import loud_regions, soft_speech_level
 
     if not words:
         return []
@@ -268,7 +268,27 @@ def untranscribed_speech(words: List[Word], energy: "Energy", total: float, min_
     out: List[Span] = []
     for gs, ge in bounds:
         if ge - gs >= min_len:
-            out.extend(loud_regions(energy, gs + 0.05, ge - 0.05, min_len=min_len))
+            out.extend(loud_regions(energy, gs + 0.05, ge - 0.05, min_len=min_len,
+                                    level=soft_speech_level(energy)))
+    return out
+
+
+def collapse_phantom_repeats(words: List[Word], max_rate: float = 10.0) -> List[Word]:
+    """위스퍼가 한 번 말한 단어를 여러 번 받아적은 것("2013년 2013년"을 1초 안에)을
+    하나로 합친다. 소리는 이미 안 자르지만(반복 감지의 속도 검사), 자막에 두 번
+    나오는 문제가 있어서 단어 목록 자체를 정리한다."""
+    out: List[Word] = []
+    i, n = 0, len(words)
+    while i < n:
+        j = i + 1
+        key = normalize(words[i].text)
+        while j < n and key and normalize(words[j].text) == key:
+            j += 1
+        if j - i >= 2 and not _plausible_rate(words[i:j], max_rate):
+            out.append(Word(text=words[i].text, start=words[i].start, end=words[j - 1].end))
+        else:
+            out.extend(words[i:j])
+        i = j
     return out
 
 

@@ -125,13 +125,16 @@ def refine_silence_spans(spans: List[Span], en: Energy, tail_margin: float = 0.1
     return out
 
 
-def loud_regions(en: Energy, t0: float, t1: float, min_len: float = 0.25) -> List[Span]:
-    """[t0, t1] 안에서 확실히 말소리로 보이는 구간들 (speech_on 이상이 min_len초 이상)."""
+def loud_regions(en: Energy, t0: float, t1: float, min_len: float = 0.25,
+                 level: float = None) -> List[Span]:
+    """[t0, t1] 안에서 말소리로 보이는 구간들 (level 이상이 한 번이라도 있고,
+    speech_off 이상이 min_len초 이상 이어지는 곳). level 기본값은 speech_on."""
+    lvl = en.speech_on if level is None else level
     a, b = en.frame(t0), en.frame(t1)
     regions = []
     i = a
     while i < b:
-        if en.db[i] >= en.speech_on:
+        if en.db[i] >= lvl:
             j = i
             while j < b and en.db[j] >= en.speech_off:
                 j += 1
@@ -145,6 +148,13 @@ def loud_regions(en: Energy, t0: float, t1: float, min_len: float = 0.25) -> Lis
         else:
             i += 1
     return regions
+
+
+def soft_speech_level(en: Energy) -> float:
+    """작게 말한 소리까지 '말소리'로 보는 기준. 다시 말할 때 목소리가 작아지는 경우가
+    있어서(실제로 두 번째 "고속도로 접근도"를 놓친 사례), 받아쓰기 빈 곳을 찾을 때는
+    speech_on보다 낮은 이 기준을 쓴다."""
+    return min(en.speech_on, en.speech_off + 4.0)
 
 
 def _split_around_speech(en: Energy, s: float, e: float, tail_margin: float,
