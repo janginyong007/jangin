@@ -1,0 +1,200 @@
+"""무음 구간 / 필러워드 / 반복 발화(버벅임)를 감지해서 컷 구간을 계산한다."""
+from __future__ import annotations
+
+import re
+from typing import List, Optional, Tuple
+
+from .transcribe import Word
+
+Span = Tuple[float, float]
+
+_PUNCT_RE = re.compile(r"[.,!?…~\"'　\s]+")
+
+
+def normalize(text: str) -> str:
+    return _PUNCT_RE.sub("", text).lower()
+
+
+# 반복 감지 전용: 조사가 붙었는지 여부로 같은 말인데 다른 토큰이 되는 걸 막는다.
+# 예: 다시 말할 때 뒤에 숫자가 더 붙으면 "보증금은"(한 토큰) -> "보증금"+"2억원은"
+# (두 토큰)으로 위스퍼가 다르게 쪼개서, 완전 반복인데도 단어가 다르게 보였다.
+_TRAILING_PARTICLES = ("은", "는", "이", "가", "을", "를", "의", "에", "도", "만", "과", "와", "로")
+
+
+def _repeat_key(text: str) -> str:
+    norm = normalize(text)
+    for p in _TRAILING_PARTICLES:
+        if len(norm) > len(p) and norm.endswith(p):
+            return norm[: -len(p)]
+    return norm
+
+
+def find_silence_gaps(words: List[Word], total_duration: float, min_gap: float) -> List[Span]:
+    spans: List[Span] = []
+    if not words:
+        return [(0.0, total_duration)] if total_duration >= min_gap else []
+
+    if words[0].start >= min_gap:
+        spans.append((0.0, words[0].start))
+
+    for a, b in zip(words, words[1:]):
+        gap = b.start - a.end
+        if gap >= min_gap:
+            spans.append((a.end, b.start))
+
+    tail = total_duration - words[-1].end
+    if tail >= min_gap:
+        spans.append((words[-1].end, total_duration))
+
+    return spans
+
+
+def find_filler_words(words: List[Word], filler_words: List[str], max_duration: float) -> List[Span]:
+    filler_set = {normalize(w) for w in filler_words}
+    spans: List[Span] = []
+    for w in words:
+        if normalize(w.text) in filler_set and (w.end - w.start) <= max_duration:
+            spans.append((w.start, w.end))
+    return spans
+
+
+def find_repeated_phrases(
+    words: List[Word], window: float, max_ngram: int = 12, max_gap_words: int = 4
+) -> List[Span]:
+    """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
+
+    두 반복 사이에 최대 max_gap_words개의 다른 단어가 끼어있어도 같은 반복으로
+    인정한다 - 발음이 마음에 안 들어 다시 말할 때 "모텔 임대료는" 같은 짧은
+    도입구를 새로 붙이고 나머지는 그대로 반복하는 경우가 실제로 있었다
+    (예: "29억 원대에 낙찰받는다고 계산하면 2.5%대입니다." 뒤에 "모텔 임대료는"을
+    붙여 같은 문장을 다시 반복). 그 사이에 낀 단어는 컷하지 않고 남긴다 - 새로
+    추가된 맥락일 수 있으므로. 단어 1개짜리 반복(간투사 중복 등)은 우연의 일치를
+    피하기 위해 간격 없이 바로 붙어있을 때만 잡는다.
+
+    비교는 조사를 뗀 형태(_repeat_key)로 한다 - 다시 말할 때 뒤에 말이 더
+    붙으면 위스퍼가 같은 단어를 다르게 쪼갠다 (예: "보증금은"(한 토큰)을 다시
+    말하면서 숫자를 덧붙이면 "보증금"+"2억원은"(두 토큰)이 됨) - 이러면 조사
+    포함 완전 일치로는 절대 안 걸린다."""
+    spans: List[Span] = []
+    n = len(words)
+    norm = [_repeat_key(w.text) for w in words]
+    i = 0
+    while i < n:
+        matched = False
+        max_len = min(max_ngram, n - i)
+        for glen in range(max_len, 0, -1):
+            j = i + glen
+            if j > n:
+                continue
+            ngram = norm[i:j]
+            if not any(ngram):
+                continue
+            gap_range = range(0, max_gap_words + 1) if glen >= 2 else range(0, 1)
+            for gap in gap_range:
+                k = j + gap
+                m = k + glen
+                if m > n:
+                    continue
+                if norm[k:m] == ngram:
+                    time_gap = words[k].start - words[j - 1].end
+                    if time_gap <= window:
+                        spans.append((words[i].start, words[j - 1].end))
+                        i = k
+                        matched = True
+                        break
+            if matched:
+                break
+        if not matched:
+            i += 1
+    return spans
+
+
+def merge_spans(spans: List[Span]) -> List[Span]:
+    if not spans:
+        return []
+    spans = sorted(spans)
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def shrink_spans(spans: List[Span], pad_before: float, pad_after: float) -> List[Span]:
+    """컷 구간을 양쪽에서 줄여서(=유지 구간을 늘려서) 말이 안 잘리게 한다.
+    pad_before: 컷 시작 쪽 여유 (직전 단어의 '어미'가 잘리지 않도록 보호)
+    pad_after: 컷 끝나는 쪽 여유 (다음 단어의 초반이 잘리지 않도록 보호)"""
+    result = []
+    for s, e in spans:
+        ns, ne = s + pad_before, e - pad_after
+        if ne > ns:
+            result.append((ns, ne))
+    return result
+
+
+def compute_keep_spans(cut_spans: List[Span], total_duration: float, min_keep_duration: float) -> List[Span]:
+    cuts = merge_spans(cut_spans)
+    keep: List[Span] = []
+    cursor = 0.0
+    for cs, ce in cuts:
+        cs = max(0.0, min(cs, total_duration))
+        ce = max(0.0, min(ce, total_duration))
+        if cs > cursor:
+            keep.append((cursor, cs))
+        cursor = max(cursor, ce)
+    if cursor < total_duration:
+        keep.append((cursor, total_duration))
+    return [(s, e) for s, e in keep if e - s >= min_keep_duration]
+
+
+def detect_cuts(
+    words: List[Word],
+    total_duration: float,
+    cfg: dict,
+    ai_spans: Optional[List[Span]] = None,
+) -> Tuple[List[Span], dict]:
+    """전체 컷 감지 파이프라인. keep_spans와 통계(dict)를 반환.
+    ai_spans: disfluency.py가 Claude로 찾아낸 추가 컷 구간 (말더듬/재시도 등,
+    사전 매칭이나 완전 반복 감지로는 못 잡는 것들). 없으면 룰 기반 결과만 쓴다."""
+    silence_spans = find_silence_gaps(words, total_duration, cfg["silence_min_gap"])
+    filler_spans = find_filler_words(words, cfg["filler_words"], cfg["filler_max_duration"])
+    repeat_spans = find_repeated_phrases(
+        words,
+        cfg["repeat_window"],
+        max_ngram=cfg.get("repeat_max_ngram", 12),
+        max_gap_words=cfg.get("repeat_max_gap_words", 4),
+    )
+    ai_spans = ai_spans or []
+
+    # 무음 컷은 앞뒤에 진짜 침묵(여유 공간)이 있어서 padding_before/after를
+    # 넉넉하게(기본 0.6/0.15초) 줘도 안전하다 - 그 여유는 어차피 침묵을 갚아먹을
+    # 뿐이다. 하지만 필러/반복/AI 컷은 바로 옆에 실제 말이 붙어있는 경우가 많아서
+    # 같은 큰 padding을 쓰면 "자를 구간의 맨 앞/뒤 단어"가 그대로 살아남는
+    # 문제가 생긴다 (실제로 "이 사이에서 세입자의 보증금은"을 컷했는데
+    # padding_before=0.6이 그 구간의 첫 단어 "이"(0.4초)보다 커서, "이"만
+    # 살아남아 다음 문장 앞에 "이 이 사이에서..."처럼 겹쳐 보이는 버그가 있었음).
+    # 그래서 필러/반복/AI 컷에는 훨씬 작은 padding만 준다.
+    silence_padded = shrink_spans(merge_spans(silence_spans), cfg["padding_before"], cfg["padding_after"])
+    content_padded = shrink_spans(
+        merge_spans(filler_spans + repeat_spans + ai_spans),
+        cfg.get("content_padding_before", 0.05),
+        cfg.get("content_padding_after", 0.05),
+    )
+    merged = merge_spans(silence_padded + content_padded)
+    keep_spans = compute_keep_spans(merged, total_duration, cfg["min_keep_duration"])
+
+    total_cut = total_duration - sum(e - s for s, e in keep_spans)
+    stats = {
+        "silence_spans": len(silence_spans),
+        "filler_spans": len(filler_spans),
+        "repeat_spans": len(repeat_spans),
+        "ai_spans": len(ai_spans),
+        "merged_cut_spans": len(merged),
+        "keep_spans": len(keep_spans),
+        "total_duration": total_duration,
+        "total_cut_seconds": total_cut,
+        "kept_duration": total_duration - total_cut,
+    }
+    return keep_spans, stats
