@@ -421,6 +421,19 @@ def find_sentence_retakes(words: List[Word], energy: Optional["Energy"] = None, 
     return spans
 
 
+def _has_quiet(energy: "Energy", t0: float, t1: float, min_len: float = 0.08) -> bool:
+    """[t0, t1] 안에 min_len초 이상 조용한 구간이 있는지."""
+    run = 0
+    for f in range(energy.frame(t0), energy.frame(t1)):
+        if energy.db[f] < energy.speech_off + 3.0:
+            run += 1
+            if run * 0.01 >= min_len:
+                return True
+        else:
+            run = 0
+    return False
+
+
 def _extend_to_sound_edges(spans: List[Span], words: List[Word], energy: "Energy") -> List[Span]:
     """말 컷(반복/필러/AI)의 경계를 실제 소리 끝까지 넓힌다. 위스퍼가 단어 끝을 일찍
     찍어서, 잘라낸 테이크의 꼬리("편합니…"의 "…니")가 0.2초쯤 남는 문제 방지.
@@ -559,6 +572,12 @@ def detect_cuts(
     보정해서 말끝/첫소리가 잘리지 않게 한다. 없으면 기존처럼 위스퍼 시각만 쓴다."""
     silence_spans = find_silence_gaps(words, total_duration, cfg["silence_min_gap"])
     filler_spans = find_filler_words(words, cfg["filler_words"], cfg["filler_max_duration"])
+    if energy is not None and cfg.get("filler_require_pause", True):
+        # 간투사는 앞뒤에 짧은 쉼이 있어 '따로 떨어진' 경우만 자른다. 위스퍼가 시각을 한 단어씩
+        # 밀어 찍으면 간투사 자리에 앞 문장의 끝말이 들어있을 수 있다
+        # (실제 사례: "…5억 6,300만원입니다 이제" 에서 "…니다"가 "이제"로 잘려나감)
+        filler_spans = [(fs, fe) for fs, fe in filler_spans
+                        if _has_quiet(energy, fs - 0.2, fs + 0.05) and _has_quiet(energy, fe - 0.05, fe + 0.2)]
     pairs: list = []
     repeat_spans = find_repeated_phrases(
         words,
