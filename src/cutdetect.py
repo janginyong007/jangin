@@ -434,24 +434,123 @@ def _has_quiet(energy: "Energy", t0: float, t1: float, min_len: float = 0.08) ->
     return False
 
 
-def _extend_to_sound_edges(spans: List[Span], words: List[Word], energy: "Energy") -> List[Span]:
-    """말 컷(반복/필러/AI)의 경계를 실제 소리 끝까지 넓힌다. 위스퍼가 단어 끝을 일찍
-    찍어서, 잘라낸 테이크의 꼬리("편합니…"의 "…니")가 0.2초쯤 남는 문제 방지.
-    옆 단어(남기는 말)를 침범하지 않는 범위에서만 넓힌다."""
+def _extend_to_sound_edges(spans: List[Span], words: List[Word], energy: "Energy",
+                           caps: Optional[List[float]] = None) -> List[Span]:
+    """말 컷(반복/필러/AI)의 경계를 실제 소리 덩어리에 맞춘다.
+
+    위스퍼 단어 시각은 0.2~0.4초씩 어긋나는 일이 흔하다. 그대로 자르면 잘라낸 테이크의
+    꼬리가 남거나("편합니…"의 "…니", "보증금 문제가" 뒤 "끅") 남길 말이 잘린다("2026 타경"의 "경").
+    - 경계가 말소리 한가운데 걸리면: 그 소리 덩어리(0.04초 이상 끊기면 다른 덩어리)가
+      자를 단어와 남길 단어 중 어느 쪽에 가까운지(단어 가운데 시각 기준)로 통째로 자르거나 남긴다.
+    - 경계가 조용한 곳이면: 자를 쪽 소리가 조금 더 이어지는지 보고 실제 쉼까지 넓힌다.
+    - caps: 반복에서 '남길 테이크'의 실제 소리 시작 시각들. 컷은 절대 이걸 넘지 않는다
+      (실제 사례: "법원은 법원은"이 겹쳐 찍혀 뒤 "법원은"까지 잘림)."""
     from .audio_energy import run_end_after, run_start_before
 
+    mids = [(w.start + w.end) / 2 for w in words]
     out = []
     for s, e in spans:
-        nxt = min((w.start for w in words if w.start >= e - 0.01), default=e + 1.0)
-        prv = max((w.end for w in words if w.end <= s + 0.01), default=s - 1.0)
-        e2 = run_end_after(energy, e - 0.05, max_fwd=0.6)
-        if e < e2 < nxt - 0.1:
-            e = e2
-        s2 = run_start_before(energy, s + 0.05, max_back=0.6)
-        if prv + 0.1 < s2 < s:
-            s = s2
-        out.append((s, e))
+        inside = [m for m in mids if s - 0.01 <= m <= e + 0.01]
+        cut_first = inside[0] if inside else (s + e) / 2
+        cut_last = inside[-1] if inside else (s + e) / 2
+        prv = max((m for m in mids if m < s - 0.01), default=s - 1.0)
+        nxt = min((m for m in mids if m > e + 0.01), default=e + 1.0)
+        # 반복에서 남길 테이크의 실제 소리 시작(caps)이 바로 뒤에 있으면 그게 더 믿을 만한 한계다
+        # (위스퍼가 남길 테이크 첫 단어를 앞 테이크에 겹쳐 찍는 일이 있음)
+        cap_after = [c for c in (caps or []) if e - 0.3 < c <= e + 1.5]
+        if cap_after:
+            nxt = min(cap_after) + 0.1
+
+        # 끝 경계 (말소리 '한가운데'에 걸린 경우만 덩어리 판정. 덩어리 끝 근처면 이미 제자리)
+        re_ = run_end_after(energy, e - 0.01, max_fwd=1.5, min_pause=0.04) if _speaking(energy, e - 0.01) else e
+        rs_e = run_start_before(energy, e - 0.01, max_back=1.5, min_pause=0.04) if re_ > e + 0.05 else e
+        if re_ > e + 0.05 and re_ - rs_e <= 0.6:   # 짧은 덩어리(한두 음절)만 판정. 긴 덩어리는 위스퍼 시각 유지
+            rs = rs_e
+            center = (rs + re_) / 2
+            if abs(center - cut_last) <= abs(center - nxt):
+                e = max(e, re_)      # 자를 단어의 소리 -> 덩어리 끝까지 자름
+            elif rs > s:
+                e = rs               # 남길 단어의 소리 -> 덩어리 앞에서 멈춤
+        else:
+            e2 = run_end_after(energy, e - 0.05, max_fwd=1.0, min_pause=0.12)
+            if e < e2 < nxt - 0.1 and e2 < e - 0.05 + 0.98:
+                e = e2
+        # 끝 경계 한 번 더: 넓힌 끝 바로 뒤에 짧은 소리 조각(끅/입소리)이 붙어 있으면 같이 자른다
+        e3 = run_end_after(energy, e + 0.005, max_fwd=0.5, min_pause=0.12)
+        if e < e3 and e3 - e <= 0.35 and e3 < nxt - 0.1 and not any(e < m < e3 for m in mids):
+            e = e3
+
+        # 시작 경계 (말소리 '한가운데'에 걸린 경우만. 덩어리 시작 근처면 이미 제자리)
+        rs = run_start_before(energy, s + 0.01, max_back=1.5, min_pause=0.04) if _speaking(energy, s + 0.01) else s
+        re_s = run_end_after(energy, s + 0.01, max_fwd=1.5, min_pause=0.04) if rs < s - 0.05 else s
+        if rs < s - 0.05 and re_s - rs <= 0.6:
+            re_ = re_s
+            center = (rs + re_) / 2
+            if abs(center - prv) < abs(center - cut_first) and re_ < e:
+                s = re_              # 앞(남길) 단어의 소리 -> 덩어리 뒤부터 자름
+            elif rs > prv:
+                s = min(s, rs)       # 자를 단어의 소리 -> 덩어리 처음부터 자름
+        else:
+            s2 = run_start_before(energy, s + 0.05, max_back=1.0, min_pause=0.12)
+            if prv + 0.1 < s2 < s and s2 > s + 0.05 - 0.98:
+                s = s2
+
+        for c in caps or []:
+            if s < c < e:
+                e = c - 0.02
+        if e > s:
+            out.append((s, e))
     return out
+
+
+def kept_take_onsets(words: List[Word], pairs, energy: "Energy", glen_of=None) -> List[float]:
+    """반복 쌍에서 '남길 테이크' 첫 단어의 실제 소리 시작: 그 단어 가운데 이후로 끝나는
+    첫 번째 0.3초 이상 소리 덩어리의 시작 (짧은 입소리/끅은 건너뜀)."""
+    from .audio_energy import next_run_start, run_end_after, run_start_before
+
+    out = []
+    for i, j, k in pairs:
+        # 앞 테이크 마지막 단어 가운데 이후에 '새로 시작하는' 소리 덩어리 중 첫 번째 0.25초 이상짜리
+        # 앞 테이크 끝(뒤 테이크와 겹쳐 찍혔으면 뒤 테이크 시작) 이후에 새로 시작하는 소리 덩어리 중
+        # 첫 번째 0.3초 이상짜리 (짧은 입소리/끅은 건너뜀)
+        a_mid = (words[j - 1].start + words[j - 1].end) / 2
+        frm = max(a_mid, min(words[j - 1].end, words[k].start)) - 0.05
+        t = frm
+        if _speaking(energy, t):
+            t = run_end_after(energy, t, max_fwd=3.0, min_pause=0.04)
+            # frm이 이미 새 덩어리의 시작 부근이면 그 덩어리부터
+            rs = run_start_before(energy, frm + 0.01, max_back=1.5, min_pause=0.04)
+            if rs >= frm - 0.01:
+                t = rs - 0.01
+        t = next_run_start(energy, t + 0.005, t + 3.0)
+        for _ in range(6):
+            end = run_end_after(energy, t + 0.005, max_fwd=2.0, min_pause=0.04)
+            if end - t >= 0.3:
+                break
+            t = next_run_start(energy, end + 0.005, end + 3.0)
+        out.append(t)
+    return out
+
+
+def _speaking(energy: "Energy", t: float) -> bool:
+    return energy.db[energy.frame(t)] >= energy.speech_off + 3.0
+
+
+def _nearest_gap(energy: "Energy", t: float, back: float, fwd: float, min_len: float = 0.04):
+    """t 근처(앞 back초 ~ 뒤 fwd초)에서 min_len 이상 조용한 틈의 가운데 중 t에 가장 가까운 시각."""
+    q = energy.speech_off + 3.0
+    a, b = energy.frame(t - back), energy.frame(t + fwd)
+    best, run = None, 0
+    for f in range(a, b + 1):
+        if f < len(energy.db) and energy.db[f] < q:
+            run += 1
+            continue
+        if run * 0.01 >= min_len:
+            mid = energy.time(f - run // 2)
+            if best is None or abs(mid - t) < abs(best - t):
+                best = mid
+        run = 0
+    return best
 
 
 def _apply_moves(words: List[Word], moves) -> List[Word]:
@@ -509,11 +608,17 @@ def _drop_overlapping_alternatives(words: List[Word]) -> List[Word]:
             ov = min(p.end, w.end) - max(p.start, w.start)
             short = min(p.end - p.start, w.end - w.start)
             kp, kw = normalize(p.text), normalize(w.text)
-            # 똑같은 단어가 겹친 건 진짜 버벅임일 수 있어(반복 감지가 잘라야 함) 건드리지 않는다
-            if short > 0 and ov >= 0.5 * short and kp and kw and kp != kw and kp[0] == kw[0]:
-                if (w.end - w.start) > (p.end - p.start):
-                    out[-1] = w
-                continue
+            if short > 0 and ov >= 0.5 * short and kp and kw and kp[0] == kw[0]:
+                if kp != kw:
+                    if (w.end - w.start) > (p.end - p.start):
+                        out[-1] = w
+                    continue
+                # 똑같은 단어가 겹친 경우: 두 번 말할 시간이 없으면(초당 7음절 초과) 한 번 말한 것
+                # (실제 사례: "타경"을 한 번 말했는데 겹쳐서 두 번 적힘 -> 반복으로 보고 잘라서 "타경"이 사라짐)
+                # 시간이 충분하면 진짜 버벅임("법원은 법원은")이라 반복 감지가 자르도록 둔다
+                if not _plausible_rate([p, w], 7.0):
+                    out[-1] = Word(text=p.text, start=min(p.start, w.start), end=max(p.end, w.end))
+                    continue
         out.append(w)
     return out
 
@@ -634,7 +739,8 @@ def detect_cuts(
             head_margin=cfg.get("energy_head_margin", 0.08),
         )
         content_padded = snap_content_spans(content_padded, energy)
-        content_padded = _extend_to_sound_edges(content_padded, words, energy)
+        caps = kept_take_onsets(words, pairs, energy)
+        content_padded = _extend_to_sound_edges(content_padded, words, energy, caps)
     merged = merge_spans(silence_padded + content_padded)
     keep_spans = compute_keep_spans(merged, total_duration, cfg["min_keep_duration"])
     if energy is not None and cfg.get("energy_refine", True):

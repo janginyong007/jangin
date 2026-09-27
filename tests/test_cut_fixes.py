@@ -286,3 +286,12 @@ def test_sentence_retake_not_for_different_sentences():
     a = words_of("이 물건의 감정가는 9억 8천만 원입니다", start=0.0)
     b = words_of("이 물건의 최저가는 6억 8천만 원입니다", start=a[-1].end + 1.0)
     assert find_sentence_retakes(a + b) == []
+
+
+def test_overlapping_identical_words():
+    from src.cutdetect import collapse_phantom_repeats
+    ws = [Word("2026", 283.57, 284.25), Word("타경", 284.25, 284.65), Word("타경", 284.35, 284.67),
+          Word("121호입니다.", 284.67, 286.79)]
+    assert [w.text for w in collapse_phantom_repeats(ws)] == ["2026", "타경", "121호입니다."]
+    real = [Word("법원은", 294.93, 295.95), Word("법원은", 295.65, 295.95)]   # 진짜 버벅임
+    assert len(collapse_phantom_repeats(real)) == 2
