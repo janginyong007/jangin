@@ -38,7 +38,7 @@ from .utils import (
 LogFn = Callable[[str], None]
 
 # 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
-VERSION = "2026-09-27 수정판 2 (연도 반복 오류 수정)"
+VERSION = "2026-09-27 수정판 3 (리포트에 전체 받아쓰기)"
 
 
 def run_pipeline(
@@ -136,7 +136,7 @@ def run_pipeline(
         }
 
     if apply_cuts:
-        report_path = write_cut_report(media_path, draft_name, stats)
+        report_path = write_cut_report(media_path, draft_name, stats, words=words, keep_spans=keep_spans)
         log(f"      컷 리포트(무엇을 왜 잘랐는지): {report_path}")
 
     if not keep_spans:
@@ -221,9 +221,21 @@ def _fmt_ts(t: float) -> str:
     return f"{int(m):02d}:{sec:05.2f}"
 
 
-def write_cut_report(media_path: str, draft_name: str, stats: dict) -> str:
+def _edited_time(t: float, keep_spans) -> Optional[float]:
+    """원본 시각 t가 편집본에서 몇 초인지 (잘려나간 곳이면 None)."""
+    acc = 0.0
+    for s, e in keep_spans:
+        if s <= t <= e:
+            return acc + (t - s)
+        acc += e - s
+    return None
+
+
+def write_cut_report(media_path: str, draft_name: str, stats: dict, words=None, keep_spans=None) -> str:
     """잘라낸 말(필러/반복/AI검토)을 원본 시각과 함께 적은 txt. 필요한 말이 잘렸을 때
-    어떤 규칙 때문인지 바로 알 수 있게 원본 영상 옆에 저장한다."""
+    어떤 규칙 때문인지 바로 알 수 있게 원본 영상 옆에 저장한다.
+    words/keep_spans를 주면 전체 받아쓰기(잘린 말 표시, 편집본 시각 포함)도 덧붙인다 -
+    반복을 못 잡았을 때 위스퍼가 그 부분을 어떻게 받아적었는지 확인하는 용도."""
     path = os.path.join(os.path.dirname(media_path), f"{draft_name}_컷리포트.txt")
     lines = [
         f"컷 리포트 - {os.path.basename(media_path)}",
@@ -237,6 +249,47 @@ def write_cut_report(media_path: str, draft_name: str, stats: dict) -> str:
             lines.append(f"            바로 뒤 이어지는 말: \"{r['after']}\"")
     if not stats.get("cut_details"):
         lines.append("(말이 들어있는 컷 없음)")
+
+    if words and keep_spans:
+        lines += [
+            "",
+            "=" * 60,
+            "전체 받아쓰기 (음성 인식이 받아적은 그대로)",
+            "  [원본 시각 | 편집본 시각]  ⟦ ⟧ 안의 말은 잘려나간 말입니다.",
+            "  편집본을 들으면서 이상한 곳이 있으면 '편집본 시각'으로 찾으세요.",
+            "=" * 60,
+        ]
+        line_words: list = []
+
+        def flush():
+            if not line_words:
+                return
+            t0 = line_words[0].start
+            ed = next((x for x in (_edited_time((w.start + w.end) / 2, keep_spans) for w in line_words)
+                       if x is not None), None)
+            ed_s = _fmt_ts(ed) if ed is not None else "  (잘림) "
+            text, in_cut = [], False
+            for w in line_words:
+                cut = _edited_time((w.start + w.end) / 2, keep_spans) is None
+                if cut and not in_cut:
+                    text.append("⟦")
+                if not cut and in_cut:
+                    text.append("⟧")
+                in_cut = cut
+                text.append(w.text.strip())
+            if in_cut:
+                text.append("⟧")
+            joined = " ".join(text).replace("⟦ ", "⟦").replace(" ⟧", "⟧")
+            lines.append(f"[{_fmt_ts(t0)} | {ed_s}] {joined}")
+            line_words.clear()
+
+        for i, w in enumerate(words):
+            # 0.5초 이상 쉬거나 한 줄이 너무 길어지면 줄바꿈
+            if line_words and (w.start - line_words[-1].end >= 0.5 or len(line_words) >= 14):
+                flush()
+            line_words.append(w)
+        flush()
+
     with open(path, "w", encoding="utf-8-sig") as f:  # 메모장에서 한글 안 깨지게 BOM 포함
         f.write("\n".join(lines) + "\n")
     return path

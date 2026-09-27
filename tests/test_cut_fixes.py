@@ -149,3 +149,12 @@ def test_real_quick_repeat_still_cut():
     # 실제로 '7월에, 7월에' 라고 다시 말한 경우 (정상 속도)
     ws = [Word("7월에", 290.65, 291.1), Word("7월에", 291.5, 291.95), Word("입찰", 292.0, 292.4)]
     assert find_repeated_phrases(ws, 5.0) == [(290.65, 291.1)]
+
+
+def test_report_includes_transcript(tmp_path):
+    from src.pipeline import write_cut_report
+    ws = words_of("고속도로 접근도가") + words_of("고속도로 접근도가 좋습니다", start=1.5)
+    keeps, stats = detect_cuts(ws, 4.0, dict(CFG, repeat_window=5.0))
+    p = write_cut_report(str(tmp_path / "a.mp4"), "t", stats, words=ws, keep_spans=keeps)
+    txt = open(p, encoding="utf-8-sig").read()
+    assert "⟦고속도로 접근도가⟧" in txt and "고속도로 접근도가 좋습니다" in txt
