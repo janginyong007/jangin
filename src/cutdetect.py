@@ -78,6 +78,14 @@ def _is_fuzzy_repeat(first: str, second: str, threshold: float, min_syllables: i
     return best >= threshold
 
 
+def _word_similar(ja: str, jb: str, threshold: float) -> bool:
+    if not ja or not jb or ja[0] != jb[0]:
+        return False
+    if ja == jb:
+        return True
+    return SequenceMatcher(None, ja, jb, autojunk=False).ratio() * 100 >= threshold
+
+
 def find_silence_gaps(words: List[Word], total_duration: float, min_gap: float) -> List[Span]:
     spans: List[Span] = []
     if not words:
@@ -160,8 +168,11 @@ def find_repeated_phrases(
                 if time_gap > window:
                     continue
                 same = norm[k:m] == ngram
+                # 첫 단어끼리도 비슷해야 한다. 안 그러면 전체 유사도가 높다는 이유로
+                # 반복 바로 앞의 다른 말("그래서 이 물건은… / 이 물건은…"의 "그래서")까지
+                # 같이 잘려나간다.
                 if (not same and fuzzy_threshold > 0 and glen >= 2
-                        and jamo[i][:1] == jamo[k][:1]):  # 다시 말할 땐 첫소리는 대개 같음 (빠른 거르기)
+                        and _word_similar(jamo[i], jamo[k], fuzzy_threshold)):
                     # 다시 말할 때 위스퍼가 단어를 다르게 쪼갤 수 있으니 한 단어 더 붙여서 비교
                     same = _is_fuzzy_repeat(
                         "".join(ngram), "".join(norm[k:min(n, m + 1)]),
@@ -282,5 +293,24 @@ def detect_cuts(
         "total_duration": total_duration,
         "total_cut_seconds": total_cut,
         "kept_duration": total_duration - total_cut,
+        # 리포트용: 말이 들어있는 컷(필러/반복/AI)이 각각 무엇을 잘랐는지
+        "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans),
     }
     return keep_spans, stats
+
+
+def _words_in(words: List[Word], s: float, e: float) -> str:
+    return "".join(w.text if w.text.startswith(" ") else " " + w.text
+                   for w in words if s - 0.01 <= (w.start + w.end) / 2 <= e + 0.01).strip()
+
+
+def _cut_details(words, filler_spans, repeat_spans, ai_spans) -> List[dict]:
+    rows = []
+    for kind, spans in (("필러워드", filler_spans), ("반복발화", repeat_spans), ("AI검토", ai_spans)):
+        for s, e in spans:
+            rows.append({
+                "kind": kind, "start": s, "end": e,
+                "text": _words_in(words, s, e),
+                "after": _words_in(words, e + 0.01, e + 4.0),  # 바로 뒤에 이어지는 말 (살아남은 쪽)
+            })
+    return sorted(rows, key=lambda r: r["start"])

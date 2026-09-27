@@ -131,6 +131,10 @@ def run_pipeline(
             "kept_duration": media.duration,
         }
 
+    if apply_cuts:
+        report_path = write_cut_report(media_path, draft_name, stats)
+        log(f"      컷 리포트(무엇을 왜 잘랐는지): {report_path}")
+
     if not keep_spans:
         raise PipelineError("컷 감지 결과 남는 구간이 없습니다. config.yaml의 cut 임계값을 조정하세요.")
 
@@ -206,6 +210,32 @@ def run_pipeline(
     log("(캡컷이 이미 실행 중이었다면, 최근 프로젝트 목록을 새로고침하거나 재시작 후 확인하세요.)")
 
     return {"draft_name": draft_name, "srt_path": srt_path, "stats": stats}
+
+
+def _fmt_ts(t: float) -> str:
+    m, sec = divmod(max(0.0, t), 60)
+    return f"{int(m):02d}:{sec:05.2f}"
+
+
+def write_cut_report(media_path: str, draft_name: str, stats: dict) -> str:
+    """잘라낸 말(필러/반복/AI검토)을 원본 시각과 함께 적은 txt. 필요한 말이 잘렸을 때
+    어떤 규칙 때문인지 바로 알 수 있게 원본 영상 옆에 저장한다."""
+    path = os.path.join(os.path.dirname(media_path), f"{draft_name}_컷리포트.txt")
+    lines = [
+        f"컷 리포트 - {os.path.basename(media_path)}",
+        "시각은 '원본 영상' 기준입니다. 무음 컷은 목록에서 뺐습니다(말이 없는 구간).",
+        "필요한 말이 잘렸다면 아래에서 그 줄을 찾아 [종류]를 확인하세요.",
+        "",
+    ]
+    for r in stats.get("cut_details", []):
+        lines.append(f"[{r['kind']}] {_fmt_ts(r['start'])} ~ {_fmt_ts(r['end'])}  잘라낸 말: \"{r['text']}\"")
+        if r["after"]:
+            lines.append(f"            바로 뒤 이어지는 말: \"{r['after']}\"")
+    if not stats.get("cut_details"):
+        lines.append("(말이 들어있는 컷 없음)")
+    with open(path, "w", encoding="utf-8-sig") as f:  # 메모장에서 한글 안 깨지게 BOM 포함
+        f.write("\n".join(lines) + "\n")
+    return path
 
 
 def main() -> None:

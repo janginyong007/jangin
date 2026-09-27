@@ -31,6 +31,7 @@ class Energy:
     db: np.ndarray        # 프레임별 dBFS
     noise_floor: float
     speech_off: float     # 이 아래면 '말이 끝남'으로 본다
+    speech_on: float = 0.0  # 이 이상이면 확실히 '말하는 중'
 
     def frame(self, t: float) -> int:
         return int(min(max(t, 0.0) / HOP, len(self.db) - 1))
@@ -68,7 +69,8 @@ def energy_from_samples(x: np.ndarray, sr: int, off_margin: float = 7.0) -> Ener
     # 말끝(약한 어미)도 '말하는 중'으로 보도록 소음보다 조금만 높게 잡는다.
     # 단, 녹음이 작아도 동작하도록 peak에서 너무 가깝지 않게 제한.
     off = min(floor + off_margin, peak - 15.0)
-    return Energy(db=db, noise_floor=floor, speech_off=off)
+    on = max(off + 3.0, min(floor + 14.0, peak - 12.0))
+    return Energy(db=db, noise_floor=floor, speech_off=off, speech_on=on)
 
 
 def speech_end_after(en: Energy, t: float, limit: float, hang: float = 0.15) -> float:
@@ -119,8 +121,46 @@ def refine_silence_spans(spans: List[Span], en: Energy, tail_margin: float = 0.1
         ns = max(s, real_end + tail_margin) if real_end > s else s
         ne = min(e, real_start - head_margin) if real_start < e else e
         if ne > ns:
-            out.append((ns, ne))
+            out.extend(_split_around_speech(en, ns, ne, tail_margin, head_margin))
     return out
+
+
+def loud_regions(en: Energy, t0: float, t1: float, min_len: float = 0.25) -> List[Span]:
+    """[t0, t1] 안에서 확실히 말소리로 보이는 구간들 (speech_on 이상이 min_len초 이상)."""
+    a, b = en.frame(t0), en.frame(t1)
+    regions = []
+    i = a
+    while i < b:
+        if en.db[i] >= en.speech_on:
+            j = i
+            while j < b and en.db[j] >= en.speech_off:
+                j += 1
+            # 앞쪽 약한 첫소리까지 포함
+            k = i
+            while k > a and en.db[k - 1] >= en.speech_off:
+                k -= 1
+            if (j - k) * HOP >= min_len:
+                regions.append((en.time(k), en.time(j)))
+            i = j
+        else:
+            i += 1
+    return regions
+
+
+def _split_around_speech(en: Energy, s: float, e: float, tail_margin: float,
+                         head_margin: float) -> List[Span]:
+    """무음 컷 안에 실제 말소리가 있으면 그 부분은 남기고 컷을 쪼갠다.
+    위스퍼가 말을 통째로 빼먹고 받아적으면(가끔 있음) 그 구간이 '단어 사이
+    무음'처럼 보여서 필요한 말이 잘려나가는데, 이를 막는 안전장치."""
+    pieces = []
+    cur = s
+    for rs, re_ in loud_regions(en, s, e):
+        if rs - head_margin > cur:
+            pieces.append((cur, rs - head_margin))
+        cur = max(cur, re_ + tail_margin)
+    if e > cur:
+        pieces.append((cur, e))
+    return [(a, b) for a, b in pieces if b - a > 0.05]
 
 
 def snap_content_spans(spans: List[Span], en: Energy, window: float = 0.12) -> List[Span]:

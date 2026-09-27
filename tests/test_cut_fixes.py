@@ -93,3 +93,33 @@ def test_snap_moves_to_quiet_gap():
     en = energy_from_samples(x, SR)
     (s, e), = snap_content_spans([(1.62, 2.5)], en)
     assert 1.5 <= s <= 1.7
+
+
+def test_untranscribed_speech_is_not_cut_as_silence():
+    # 0.5~1.5초 말, 2.5~3.5초에도 말이 있는데 위스퍼가 빼먹음, 5.0초 다음 말
+    x = _speech([(0.5, 1.0, 0.1), (2.5, 1.0, 0.1), (5.0, 1.0, 0.1)], 7.0)
+    en = energy_from_samples(x, SR)
+    ws = [Word("감정가는", 0.5, 1.5), Word("다음", 5.0, 6.0)]
+    keep_old, _ = detect_cuts(ws, 7.0, CFG)
+    keep_new, _ = detect_cuts(ws, 7.0, CFG, energy=en)
+    covered = lambda keeps, t: any(s <= t <= e for s, e in keeps)
+    assert not covered(keep_old, 3.0)      # 기존: 빼먹은 말이 통째로 잘림
+    assert covered(keep_new, 2.55) and covered(keep_new, 3.55)  # 개선: 살아남음
+    assert not covered(keep_new, 4.3)      # 진짜 무음은 여전히 컷
+
+
+def test_cut_report(tmp_path):
+    from src.pipeline import write_cut_report
+    ws = words_of("음") + words_of("이 물건은 감정가가", start=1.0) + words_of("이 물건은 감정가가 삼억", start=3.0)
+    _, stats = detect_cuts(ws, 6.0, dict(CFG, repeat_window=5.0))
+    kinds = [r["kind"] for r in stats["cut_details"]]
+    assert "필러워드" in kinds and "반복발화" in kinds
+    p = write_cut_report(str(tmp_path / "a.mp4"), "테스트", stats)
+    txt = open(p, encoding="utf-8-sig").read()
+    assert "잘라낸 말: \"이 물건은 감정가가\"" in txt
+
+
+def test_fuzzy_does_not_eat_preceding_word():
+    ws = words_of("그래서 이 물건은 감종가가") + words_of("이 물건은 감정가가 삼억입니다", start=2.5)
+    spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
+    assert spans and spans[0][0] >= ws[1].start   # '그래서'는 살아남아야 함
