@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+*.mp4
+*.mov
+*.wav
+*_cutlist.json
+*_report.md
