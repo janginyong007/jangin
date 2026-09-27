@@ -265,3 +265,24 @@ def test_overlapping_alternative_words_collapsed():
     ws = [Word("해결된", 264.0, 264.6), Word("것으로", 264.61, 264.79), Word("것을", 264.63, 264.77),
           Word("보입니다.", 264.8, 265.3)]
     assert [w.text for w in collapse_phantom_repeats(ws)] == ["해결된", "것으로", "보입니다."]
+
+
+def test_sentence_retake_long_gap():
+    # 실제 사례(2:19): 긴 문장을 두 번 말하다 멈추고 세 번째에 완성
+    t1 = words_of("각 방의 취사시설 설치 여부가 대장용도와 맞는지는 확인해 대장 볼", start=140.0, dur=0.45)
+    frag = words_of("용도와 맞는지는 현장에서", start=t1[-1].end + 1.0, dur=0.45)
+    t2 = words_of("각 방에 취사 시설 설치 여부와 여부", start=frag[-1].end + 1.0, dur=0.45)
+    t3 = words_of("각 방에 취사 시설 설치 여부가 대장 용도와 맞는지는 확인해 볼 대목입니다", start=t2[-1].end + 1.0, dur=0.45)
+    nxt = words_of("감정가 9억 8천만원 가운데", start=t3[-1].end + 1.0, dur=0.45)
+    from src.cutdetect import find_sentence_retakes
+    spans = find_sentence_retakes(t1 + frag + t2 + t3 + nxt)
+    cut = lambda t: any(s <= t <= e for s, e in spans)
+    assert cut(t1[0].start) and cut(frag[0].start) and cut(t2[0].start)
+    assert not cut(t3[0].start + 0.1) and not cut(nxt[0].start + 0.1)
+
+
+def test_sentence_retake_not_for_different_sentences():
+    from src.cutdetect import find_sentence_retakes
+    a = words_of("이 물건의 감정가는 9억 8천만 원입니다", start=0.0)
+    b = words_of("이 물건의 최저가는 6억 8천만 원입니다", start=a[-1].end + 1.0)
+    assert find_sentence_retakes(a + b) == []

@@ -316,6 +316,111 @@ def retake_start_in_hole(words: List[Word], pairs, energy: "Energy", moves: Opti
     return extra
 
 
+def split_utterances(words: List[Word], energy: Optional["Energy"] = None,
+                     min_pause: float = 0.35) -> List[Tuple[int, int, float]]:
+    """쉼(말이 멈춘 곳)을 기준으로 단어들을 '한 호흡' 단위로 나눈다.
+    [(시작idx, 끝idx+1, 소리가 실제로 시작되는 시각), ...]
+    위스퍼 단어 시각은 한 단어씩 밀려 찍히는 일이 있어서(실제 사례: 140.4초에 말한 "각"을
+    139.21초부터로 찍음) 쉼과 호흡 시작 시각은 소리로 판단한다."""
+    if not words:
+        return []
+    splits = []  # (다음 호흡 첫 단어 idx, 소리 시작 시각)
+    for x in range(len(words) - 1):
+        a, b = words[x], words[x + 1]
+        if energy is None:
+            if b.start - a.end >= 0.5:
+                splits.append((x + 1, b.start))
+            continue
+        fa, fb = energy.frame(a.start), energy.frame((b.start + b.end) / 2)
+        quiet = best = best_end = 0
+        for f in range(fa, fb):
+            if energy.db[f] < energy.speech_off + 3.0:
+                quiet += 1
+                if quiet > best:
+                    best, best_end = quiet, f + 1
+            else:
+                quiet = 0
+        if best * 0.01 < min_pause:
+            continue
+        qs, qe = energy.time(best_end - best), energy.time(best_end)
+        # 단어 a가 쉼 구간에 절반 이상 걸쳐 있으면 실제로는 쉼 뒤에 말한 단어로 본다
+        a_len = max(a.end - a.start, 1e-3)
+        a_in_quiet = max(0.0, min(a.end, qe) - max(a.start, qs))
+        if a_in_quiet >= 0.5 * a_len and x > 0 and (not splits or splits[-1][0] < x):
+            splits.append((x, qe))
+        else:
+            splits.append((x + 1, max(qe, b.start) if b.start - qe < 0.3 else qe))
+    out = []
+    prev, prev_t = 0, words[0].start
+    for idx, t in splits:
+        if idx > prev:
+            out.append((prev, idx, prev_t))
+            prev, prev_t = idx, t
+    out.append((prev, len(words), prev_t))
+    return out
+
+
+def find_sentence_retakes(words: List[Word], energy: Optional["Energy"] = None, window: float = 20.0,
+                          lookahead: int = 4, head_syllables: int = 10, head_threshold: float = 85.0,
+                          min_syllables: int = 6, idx_out: Optional[list] = None) -> List[Span]:
+    """한 호흡(문장) 단위 재시도: 말하다가 멈추고 같은 문장을 처음부터 다시 말한 경우.
+    뒤에 오는 호흡(20초 이내, 4개까지) 중 '시작 부분'이 거의 같은 게 있으면 앞 호흡을 통째로 자른다.
+    실제 사례: "각 방의 취사시설 설치 여부가 대장용도와 맞는지는 확인해 대장 볼 용도와…(9초)"
+    -> 15초 뒤 "각 방에 취사 시설 설치 여부가 대장 용도와 맞는지는 확인해 볼 대목입니다".
+    단어 몇 개 차이의 짧은 반복은 find_repeated_phrases가 맡고, 이건 긴 문장 재시도용."""
+    utts = split_utterances(words, energy)
+    texts = ["".join(normalize(w.text) for w in words[a:b]) for a, b, _ in utts]
+    spans: List[Span] = []
+    for u, (a, b, t0) in enumerate(utts):
+        tu = texts[u]
+        if len(tu) < min_syllables:
+            continue
+        head_u = _jamo(tu[:head_syllables])
+        for v in range(u + 1, min(len(utts), u + 1 + lookahead)):
+            c, d, _ = utts[v]
+            if words[c].start - words[b - 1].end > window:
+                break
+            tv = texts[v]
+            n = min(len(tu), len(tv), head_syllables)
+            if n < min_syllables:
+                continue
+            if _DIGITS_RE.findall(tu[:n]) != _DIGITS_RE.findall(tv[:n]):
+                continue  # 숫자가 다르면 다른 말
+            head_v = _jamo(tv[:head_syllables])
+            m = min(len(head_u), len(head_v))
+            if SequenceMatcher(None, head_u[:m], head_v[:m], autojunk=False).ratio() * 100 < head_threshold:
+                continue
+            # 전체적으로도 앞 호흡이 뒤 호흡의 앞부분과 대체로 비슷해야 (완전히 다른 문장 방지)
+            L = len(tu)
+            whole = SequenceMatcher(None, _jamo(tu), _jamo(tv[: int(L * 1.2) + 2]), autojunk=False).ratio() * 100
+            if whole < 55:
+                continue
+            spans.append((t0, words[b - 1].end))
+            if idx_out is not None:
+                idx_out.extend(range(a, b))
+            # 두 테이크 사이에 낀 짧은 조각(말하다 만 부분)이 뒤쪽 문장들에 거의 그대로 들어있으면 같이 자른다
+            # (실제 사례: "…확인해 대장 볼 / 대장 용도와 맞는지는 현장에서 / 각 방에 취사 시설…")
+            later = _jamo("".join(texts[q] for q in range(v, min(len(utts), v + lookahead))))
+            for w_ in range(u + 1, v):
+                fa, fb, ft0 = utts[w_]
+                jf = _jamo(texts[w_])
+                if not jf or len(texts[w_]) > len(tu):
+                    continue
+                # 바로 뒤 문장의 첫머리가 쉼 때문에 떨어져 나온 것이면("각 / 방에 취사 시설…") 자르지 않는다
+                if w_ == v - 1:
+                    joined = _jamo((texts[w_] + texts[v])[:head_syllables])
+                    if (SequenceMatcher(None, head_u, joined, autojunk=False).ratio()
+                            >= SequenceMatcher(None, head_u, head_v, autojunk=False).ratio()):
+                        continue
+                cov = sum(bl.size for bl in SequenceMatcher(None, jf, later, autojunk=False).get_matching_blocks())
+                if cov / len(jf) >= 0.7:
+                    spans.append((ft0, words[fb - 1].end))
+                    if idx_out is not None:
+                        idx_out.extend(range(fa, fb))
+            break
+    return spans
+
+
 def _extend_to_sound_edges(spans: List[Span], words: List[Word], energy: "Energy") -> List[Span]:
     """말 컷(반복/필러/AI)의 경계를 실제 소리 끝까지 넓힌다. 위스퍼가 단어 끝을 일찍
     찍어서, 잘라낸 테이크의 꼬리("편합니…"의 "…니")가 0.2초쯤 남는 문제 방지.
@@ -468,6 +573,10 @@ def detect_cuts(
         filler_words=cfg.get("filler_words", []),
         pairs_out=pairs,
     )
+    sentence_spans: List[Span] = []
+    sentence_idx: list = []
+    if cfg.get("sentence_retake", True):
+        sentence_spans = find_sentence_retakes(words, energy, idx_out=sentence_idx)
     hole_spans: List[Span] = []
     moves: list = []
     if energy is not None and cfg.get("retake_hole_extend", True):
@@ -491,7 +600,7 @@ def detect_cuts(
     # 그래서 필러/반복/AI 컷에는 훨씬 작은 padding만 준다.
     silence_padded = shrink_spans(merge_spans(silence_spans), cfg["padding_before"], cfg["padding_after"])
     content_padded = shrink_spans(
-        merge_spans(filler_spans + repeat_spans + hole_spans + ai_spans),
+        merge_spans(filler_spans + repeat_spans + hole_spans + sentence_spans + ai_spans),
         cfg.get("content_padding_before", 0.05),
         cfg.get("content_padding_after", 0.05),
     )
@@ -532,11 +641,14 @@ def detect_cuts(
         "total_cut_seconds": total_cut,
         "kept_duration": total_duration - total_cut,
         # 리포트용: 말이 들어있는 컷(필러/반복/AI)이 각각 무엇을 잘랐는지
-        "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans),
+        "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans, sentence_spans),
         "ai_spans_rejected": len(ai_spans_in) - len(ai_spans),
         "untranscribed": untranscribed_speech(words, energy, total_duration) if energy is not None else [],
         # 자막/리포트용 단어 목록 (뒤 테이크 누락분을 제자리로 옮긴 것)
-        "subtitle_words": _apply_moves(words, moves),
+        "subtitle_words": _apply_moves([w for x, w in enumerate(words) if x not in set(sentence_idx)]
+                                       if sentence_idx else words, moves if not sentence_idx else
+                                       [(x - sum(1 for q in sentence_idx if q < x), s_, e_) for x, s_, e_ in moves
+                                        if x not in set(sentence_idx)]),
     }
     return keep_spans, stats
 
@@ -546,10 +658,11 @@ def _words_in(words: List[Word], s: float, e: float) -> str:
                    for w in words if s - 0.01 <= (w.start + w.end) / 2 <= e + 0.01).strip()
 
 
-def _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans=()) -> List[dict]:
+def _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans=(), sentence_spans=()) -> List[dict]:
     rows = []
     for kind, spans in (("필러워드", filler_spans), ("반복발화", repeat_spans), ("AI검토", ai_spans),
-                        ("반복발화-추정(뒤 테이크 앞부분이 받아쓰기 누락)", hole_spans)):
+                        ("반복발화-추정(뒤 테이크 앞부분이 받아쓰기 누락)", hole_spans),
+                        ("문장 재시도", sentence_spans)):
         for s, e in spans:
             rows.append({
                 "kind": kind, "start": s, "end": e,
