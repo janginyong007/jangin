@@ -1,7 +1,7 @@
 __pycache__/
 .pytest_cache/
+cache/
+secrets.yaml
 *.mp4
 *.mov
 *.wav
-*_cutlist.json
-*_report.md

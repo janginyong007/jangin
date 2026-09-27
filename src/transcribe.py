@@ -142,8 +142,18 @@ def _refine_long_words(words: List[Word], wav_path: str, model: "WhisperModel", 
     return refined
 
 
-def _cache_path(cache_dir: str, video_path: str, model_name: str) -> str:
-    key = f"{os.path.abspath(video_path)}|{model_name}|{os.path.getmtime(video_path)}"
+# 전사 방식이 바뀌면 올려서 예전 캐시(반복이 합쳐진 결과)를 다시 쓰지 않게 한다.
+_TRANSCRIBE_VERSION = "verbatim-1"
+
+# 위스퍼는 앞 문맥을 보고 말을 매끄럽게 '정리'해서, 두 번 반복한 말을 한 번으로
+# 합쳐 받아적는 경향이 있다 (그러면 텍스트에 반복이 안 남아 반복 감지가 불가능).
+# 말더듬/반복이 그대로 적힌 예시를 프롬프트로 주면 그 문체를 따라 그대로 받아적는다.
+VERBATIM_PROMPT = "음, 그, 이 물건은, 이 물건은 감정가가, 감정가가 삼억, 어, 그러니까 그러니까 말씀드리면"
+
+
+def _cache_path(cache_dir: str, video_path: str, model_name: str, verbatim: bool = True) -> str:
+    version = _TRANSCRIBE_VERSION if verbatim else "default"
+    key = f"{os.path.abspath(video_path)}|{model_name}|{os.path.getmtime(video_path)}|{version}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"transcript_{digest}.json")
 
@@ -175,7 +185,8 @@ def transcribe(video_path: str, cache_dir: str, whisper_cfg: dict) -> List[Word]
     """영상을 전사해서 단어 단위 타임스탬프 리스트를 반환한다. 결과는 캐싱됨."""
     os.makedirs(cache_dir, exist_ok=True)
     model_name = whisper_cfg.get("model", "large-v3")
-    cache_file = _cache_path(cache_dir, video_path, model_name)
+    verbatim = whisper_cfg.get("verbatim", True)
+    cache_file = _cache_path(cache_dir, video_path, model_name, verbatim)
 
     if os.path.exists(cache_file):
         print(f"[transcribe] 캐시된 전사 결과 사용: {cache_file}")
@@ -187,11 +198,20 @@ def transcribe(video_path: str, cache_dir: str, whisper_cfg: dict) -> List[Word]
     model = _load_model(model_name, whisper_cfg)
 
     language = whisper_cfg.get("language", "ko")
+    extra = {}
+    if verbatim:
+        # condition_on_previous_text=False: 앞 문장 내용을 참고해 '정리'하지 않게 해서
+        # 다시 말한 테이크가 각각 따로 받아적히도록 한다.
+        extra = dict(
+            condition_on_previous_text=False,
+            initial_prompt=whisper_cfg.get("initial_prompt", VERBATIM_PROMPT),
+        )
     segments, info = model.transcribe(
         wav_path,
         language=language,
         word_timestamps=True,
         vad_filter=True,
+        **extra,
     )
 
     words: List[Word] = []

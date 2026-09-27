@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Tuple
+from difflib import SequenceMatcher
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from .transcribe import Word
+
+if TYPE_CHECKING:
+    from .audio_energy import Energy
 
 Span = Tuple[float, float]
 
@@ -27,6 +31,51 @@ def _repeat_key(text: str) -> str:
         if len(norm) > len(p) and norm.endswith(p):
             return norm[: -len(p)]
     return norm
+
+
+_CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+_JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+_JONG = " ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ"
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _jamo(text: str) -> str:
+    """한글을 자모로 풀어쓴다 ("감정가" -> "ㄱㅏㅁㅈㅓㅇㄱㅏ").
+    발음이 꼬인 테이크는 위스퍼 인식 결과도 한두 글자 달라지기 쉬운데
+    ("감종가" vs "감정가"), 음절 단위로는 완전히 다른 글자여도 자모
+    단위로는 대부분 같아서 '비슷한 반복'을 잡을 수 있다."""
+    out = []
+    for ch in text:
+        c = ord(ch) - 0xAC00
+        if 0 <= c < 11172:
+            out.append(_CHO[c // 588])
+            out.append(_JUNG[(c % 588) // 28])
+            if c % 28:
+                out.append(_JONG[c % 28])
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _is_fuzzy_repeat(first: str, second: str, threshold: float, min_syllables: int) -> bool:
+    """first(먼저 말한 것)가 second의 앞부분을 비슷하게 다시 말한 것인지.
+    숫자가 다르면 절대 반복으로 보지 않는다 - "1억 원입니다" / "2억 원입니다"는
+    자모로는 거의 같지만 전혀 다른 정보다."""
+    if len(first) < min_syllables or not second:
+        return False
+    if _DIGITS_RE.findall(first) != _DIGITS_RE.findall(second[: len(first) + 2]):
+        return False
+    ja, jb = _jamo(first), _jamo(second)
+    n = len(ja)
+    best = 0.0
+    for m in {n, int(n * 0.85), int(n * 1.15)}:  # 두 번째 테이크 길이가 조금 달라도 허용
+        if m <= 0:
+            continue
+        sm = SequenceMatcher(None, ja, jb[:m], autojunk=False)
+        if sm.quick_ratio() * 100 < threshold:
+            continue
+        best = max(best, sm.ratio() * 100)
+    return best >= threshold
 
 
 def find_silence_gaps(words: List[Word], total_duration: float, min_gap: float) -> List[Span]:
@@ -59,7 +108,12 @@ def find_filler_words(words: List[Word], filler_words: List[str], max_duration: 
 
 
 def find_repeated_phrases(
-    words: List[Word], window: float, max_ngram: int = 12, max_gap_words: int = 4
+    words: List[Word],
+    window: float,
+    max_ngram: int = 12,
+    max_gap_words: int = 4,
+    fuzzy_threshold: float = 0.0,
+    fuzzy_min_syllables: int = 4,
 ) -> List[Span]:
     """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
 
@@ -74,10 +128,17 @@ def find_repeated_phrases(
     비교는 조사를 뗀 형태(_repeat_key)로 한다 - 다시 말할 때 뒤에 말이 더
     붙으면 위스퍼가 같은 단어를 다르게 쪼갠다 (예: "보증금은"(한 토큰)을 다시
     말하면서 숫자를 덧붙이면 "보증금"+"2억원은"(두 토큰)이 됨) - 이러면 조사
-    포함 완전 일치로는 절대 안 걸린다."""
+    포함 완전 일치로는 절대 안 걸린다.
+
+    fuzzy_threshold > 0이면 완전히 같지 않아도, 자모 단위 유사도가 이 값
+    이상이면 반복으로 본다 - 발음이 꼬여서 다시 말한 경우 첫 테이크의 인식
+    결과가 한두 글자 틀리기 때문 ("감종가는" / "감정가는"). 우연히 비슷한 말을
+    잡지 않도록 2단어 이상 + fuzzy_min_syllables 음절 이상일 때만 적용하고,
+    숫자가 다르면 제외한다."""
     spans: List[Span] = []
     n = len(words)
     norm = [_repeat_key(w.text) for w in words]
+    jamo = [_jamo(t) for t in norm]
     i = 0
     while i < n:
         matched = False
@@ -95,13 +156,22 @@ def find_repeated_phrases(
                 m = k + glen
                 if m > n:
                     continue
-                if norm[k:m] == ngram:
-                    time_gap = words[k].start - words[j - 1].end
-                    if time_gap <= window:
-                        spans.append((words[i].start, words[j - 1].end))
-                        i = k
-                        matched = True
-                        break
+                time_gap = words[k].start - words[j - 1].end
+                if time_gap > window:
+                    continue
+                same = norm[k:m] == ngram
+                if (not same and fuzzy_threshold > 0 and glen >= 2
+                        and jamo[i][:1] == jamo[k][:1]):  # 다시 말할 땐 첫소리는 대개 같음 (빠른 거르기)
+                    # 다시 말할 때 위스퍼가 단어를 다르게 쪼갤 수 있으니 한 단어 더 붙여서 비교
+                    same = _is_fuzzy_repeat(
+                        "".join(ngram), "".join(norm[k:min(n, m + 1)]),
+                        fuzzy_threshold, fuzzy_min_syllables,
+                    )
+                if same:
+                    spans.append((words[i].start, words[j - 1].end))
+                    i = k
+                    matched = True
+                    break
             if matched:
                 break
         if not matched:
@@ -154,10 +224,13 @@ def detect_cuts(
     total_duration: float,
     cfg: dict,
     ai_spans: Optional[List[Span]] = None,
+    energy: Optional["Energy"] = None,
 ) -> Tuple[List[Span], dict]:
     """전체 컷 감지 파이프라인. keep_spans와 통계(dict)를 반환.
     ai_spans: disfluency.py가 Claude로 찾아낸 추가 컷 구간 (말더듬/재시도 등,
-    사전 매칭이나 완전 반복 감지로는 못 잡는 것들). 없으면 룰 기반 결과만 쓴다."""
+    사전 매칭이나 완전 반복 감지로는 못 잡는 것들). 없으면 룰 기반 결과만 쓴다.
+    energy: audio_energy.load_energy() 결과. 주면 컷 경계를 실제 소리 크기로
+    보정해서 말끝/첫소리가 잘리지 않게 한다. 없으면 기존처럼 위스퍼 시각만 쓴다."""
     silence_spans = find_silence_gaps(words, total_duration, cfg["silence_min_gap"])
     filler_spans = find_filler_words(words, cfg["filler_words"], cfg["filler_max_duration"])
     repeat_spans = find_repeated_phrases(
@@ -165,6 +238,8 @@ def detect_cuts(
         cfg["repeat_window"],
         max_ngram=cfg.get("repeat_max_ngram", 12),
         max_gap_words=cfg.get("repeat_max_gap_words", 4),
+        fuzzy_threshold=cfg.get("repeat_fuzzy_threshold", 80),
+        fuzzy_min_syllables=cfg.get("repeat_fuzzy_min_syllables", 4),
     )
     ai_spans = ai_spans or []
 
@@ -182,6 +257,17 @@ def detect_cuts(
         cfg.get("content_padding_before", 0.05),
         cfg.get("content_padding_after", 0.05),
     )
+    if energy is not None and cfg.get("energy_refine", True):
+        from .audio_energy import refine_silence_spans, snap_content_spans
+
+        # 위스퍼가 말끝을 일찍 끝났다고 잡아도, 실제 소리가 사그라든 뒤에만 컷을
+        # 시작한다. padding과 '둘 중 더 안전한 쪽'을 쓰는 것이라 컷이 늘어나지는 않는다.
+        silence_padded = refine_silence_spans(
+            silence_padded, energy,
+            tail_margin=cfg.get("energy_tail_margin", 0.12),
+            head_margin=cfg.get("energy_head_margin", 0.08),
+        )
+        content_padded = snap_content_spans(content_padded, energy)
     merged = merge_spans(silence_padded + content_padded)
     keep_spans = compute_keep_spans(merged, total_duration, cfg["min_keep_duration"])
 

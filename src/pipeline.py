@@ -18,12 +18,13 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
+from .audio_energy import load_energy
 from .build_draft import build_draft
 from .cutdetect import detect_cuts
 from .disfluency import review_cut_script
 from .render_audio import render_audio
 from .subtitles import build_subtitles
-from .transcribe import extract_audio_hq, transcribe
+from .transcribe import extract_audio, extract_audio_hq, transcribe
 from .utils import (
     PipelineError,
     get_anthropic_api_key,
@@ -69,7 +70,14 @@ def run_pipeline(
     if apply_cuts:
         log("[3/5] 무음/필러/반복발화 컷 구간 감지...")
         cut_cfg = cfg["cut"]
-        keep_spans, stats = detect_cuts(words, media.duration, cut_cfg)
+        energy = None
+        if cut_cfg.get("energy_refine", True):
+            # 실제 음량으로 컷 경계를 보정 (말끝 잘림 방지). 실패해도 기존 방식으로 진행.
+            try:
+                energy = load_energy(extract_audio(media_path, cache_dir))
+            except Exception as e:  # noqa: BLE001
+                log(f"      (음량 분석 실패, 기존 방식으로 진행: {e})")
+        keep_spans, stats = detect_cuts(words, media.duration, cut_cfg, energy=energy)
         log(
             f"      무음 {stats['silence_spans']}건, 필러워드 {stats['filler_spans']}건, "
             f"반복발화 {stats['repeat_spans']}건 -> 병합 후 {stats['merged_cut_spans']}개 구간 컷"
@@ -101,7 +109,9 @@ def run_pipeline(
                 log=log,
             )
             if extra_spans:
-                keep_spans, stats = detect_cuts(words, media.duration, cut_cfg, ai_spans=extra_spans)
+                keep_spans, stats = detect_cuts(
+                    words, media.duration, cut_cfg, ai_spans=extra_spans, energy=energy
+                )
                 log(
                     f"      최종 검토로 {stats['ai_spans']}개 구간 추가 컷 -> "
                     f"편집본 {stats['kept_duration']:.1f}초 (유지 구간 {stats['keep_spans']}개)"
