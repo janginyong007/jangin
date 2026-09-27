@@ -143,7 +143,7 @@ def _refine_long_words(words: List[Word], wav_path: str, model: "WhisperModel", 
 
 
 # 전사 방식이 바뀌면 올려서 예전 캐시(반복이 합쳐진 결과)를 다시 쓰지 않게 한다.
-_TRANSCRIBE_VERSION = "verbatim-3"
+_TRANSCRIBE_VERSION = "verbatim-4"
 
 # 위스퍼는 앞 문맥을 보고 말을 매끄럽게 '정리'해서, 두 번 반복한 말을 한 번으로
 # 합쳐 받아적는 경향이 있다 (그러면 텍스트에 반복이 안 남아 반복 감지가 불가능).
@@ -179,7 +179,9 @@ def _fill_transcript_gaps(words: List[Word], wav_path: str, model, language: str
     print(f"[transcribe] 받아쓰기에서 빠진 말소리 {len(holes)}곳 발견, 다시 인식 중...")
     added: List[Word] = []
     for rs, re_ in holes:
-        sub_start, sub_end = max(0.0, rs - 0.15), re_ + 0.25
+        # 1~2초짜리 조각만 따로 주면 위스퍼가 잘 못 알아듣는다 (실제로 "고속도로 접근도"를
+        # 못 받아적은 사례). 앞뒤 문맥을 같이 들려주고, 빈 곳에 해당하는 단어만 가져온다.
+        sub_start, sub_end = max(0.0, rs - 2.0), re_ + 1.5
         sub_path = os.path.join(cache_dir, f"_gap_{sub_start:.2f}_{sub_end:.2f}.wav")
         try:
             _extract_subclip(wav_path, sub_start, sub_end, sub_path)
@@ -187,13 +189,16 @@ def _fill_transcript_gaps(words: List[Word], wav_path: str, model, language: str
                                            vad_filter=False, condition_on_previous_text=False)
             for seg in segs:
                 # 숨소리/잡음을 말로 지어내는 것(환각)을 막기 위한 거르기
-                if getattr(seg, "no_speech_prob", 0.0) > 0.6 or getattr(seg, "avg_logprob", 0.0) < -1.0:
+                if getattr(seg, "no_speech_prob", 0.0) > 0.8 or getattr(seg, "avg_logprob", 0.0) < -1.5:
                     continue
                 for sw in seg.words or []:
                     text = sw.word.rstrip()
                     ws, we = sub_start + sw.start, sub_start + sw.end
-                    if text.strip() and rs - 0.3 <= ws and we <= re_ + 0.4:
-                        added.append(Word(text=text, start=ws, end=we))
+                    mid = (ws + we) / 2
+                    # 빈 곳 안에 있는 단어만 (앞뒤 문맥 단어는 이미 받아적혀 있음)
+                    if text.strip() and rs - 0.1 <= mid <= re_ + 0.1 and not any(
+                            w.start < mid < w.end for w in words):
+                        added.append(Word(text=text, start=max(ws, rs - 0.1), end=min(we, re_ + 0.1)))
         except Exception as e:  # noqa: BLE001 - 실패해도 원래 결과로 진행
             print(f"[transcribe] 빈 곳 재인식 실패({rs:.1f}초): {e}")
         finally:

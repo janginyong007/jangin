@@ -96,6 +96,13 @@ def _plausible_rate(ws: List[Word], max_rate: float) -> bool:
     return dur > 0 and syl / dur <= max_rate
 
 
+def _is_junk_word(key: str, jkey: str, ngram: List[str], ngram_jamo: List[str], fillers) -> bool:
+    """반복 사이에 낀 단어가 '버벅임'인지: 간투사이거나, 앞 구절 단어의 반복/변형."""
+    if not key or key in fillers or key in ngram:
+        return True
+    return any(_word_similar(jkey, jg, 80) for jg in ngram_jamo if len(jg) >= 2)
+
+
 def _word_similar(ja: str, jb: str, threshold: float) -> bool:
     if not ja or not jb or ja[0] != jb[0]:
         return False
@@ -143,6 +150,7 @@ def find_repeated_phrases(
     gap_min_words: int = 3,
     gap_min_syllables: int = 6,
     max_syllable_rate: float = 10.0,
+    filler_words: Optional[List[str]] = None,
 ) -> List[Span]:
     """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
 
@@ -168,6 +176,7 @@ def find_repeated_phrases(
     n = len(words)
     norm = [_repeat_key(w.text) for w in words]
     jamo = [_jamo(t) for t in norm]
+    fillers = {normalize(f) for f in (filler_words or [])}
     i = 0
     while i < n:
         matched = False
@@ -182,13 +191,19 @@ def find_repeated_phrases(
             # 사이에 다른 말이 끼어있는 반복은 짧은 구절이면 인정하지 않는다.
             # "이 건물은 튼튼합니다. 이 건물은 1990년에…"처럼 같은 말로 시작하는
             # 서로 다른 문장에서 앞 문장의 "이 건물은"만 잘려나가는 일을 막기 위함.
-            allow_gap = (glen >= 2 and glen >= gap_min_words
-                         and len("".join(ngram)) >= gap_min_syllables)
-            gap_range = range(0, max_gap_words + 1) if allow_gap else range(0, 1)
+            # 단, 사이에 낀 말이 전부 '버벅임'(앞 구절 단어의 반복/변형이나 간투사)이면
+            # 짧아도 인정하고 그 버벅임까지 같이 자른다.
+            # 예: "7월에 법원에 법원의 / 7월에 법원의 이의신청서" -> "7월에 법원에 법원의" 컷
+            long_enough = (glen >= gap_min_words and len("".join(ngram)) >= gap_min_syllables)
+            gap_range = range(0, max_gap_words + 1) if glen >= 2 else range(0, 1)
             for gap in gap_range:
                 k = j + gap
                 m = k + glen
                 if m > n:
+                    continue
+                junk_gap = gap > 0 and all(
+                    _is_junk_word(norm[x], jamo[x], ngram, jamo[i:j], fillers) for x in range(j, k))
+                if gap > 0 and not (long_enough or junk_gap):
                     continue
                 time_gap = words[k].start - words[j - 1].end
                 if time_gap > window:
@@ -209,7 +224,9 @@ def find_repeated_phrases(
                         and _plausible_rate(words[k:m], max_syllable_rate)):
                     same = False  # 사람이 낼 수 없는 속도 -> 인식 오류로 보고 자르지 않음
                 if same:
-                    spans.append((words[i].start, words[j - 1].end))
+                    # 사이에 낀 게 버벅임이면 그것까지, 새 맥락(도입구)이면 그 앞까지만 자른다
+                    end_word = words[k - 1] if junk_gap else words[j - 1]
+                    spans.append((words[i].start, end_word.end))
                     i = k
                     matched = True
                     break
@@ -218,6 +235,41 @@ def find_repeated_phrases(
         if not matched:
             i += 1
     return spans
+
+
+def _retake_follows(words: List[Word], span: Span, threshold: float, lookahead: float = 15.0) -> bool:
+    """span 안의 말과 비슷한 말이 span 바로 뒤 lookahead초 안에 다시 나오는지 (자모 유사도)."""
+    s, e = span
+    cut = "".join(normalize(w.text) for w in words if s <= (w.start + w.end) / 2 <= e)
+    after = "".join(normalize(w.text) for w in words if e < (w.start + w.end) / 2 <= e + lookahead)
+    if not cut:
+        return True  # 말이 없는 구간이면 지워도 잃을 게 없음
+    ja, jb = _jamo(cut), _jamo(after)
+    if not jb:
+        return False
+    n = len(ja)
+    step = max(1, n // 4)
+    best = 0.0
+    for st in range(0, max(1, len(jb) - n // 2), step):
+        best = max(best, SequenceMatcher(None, ja, jb[st:st + n], autojunk=False).ratio() * 100)
+        if best >= threshold:
+            return True
+    return False
+
+
+def untranscribed_speech(words: List[Word], energy: "Energy", total: float, min_len: float = 0.4) -> List[Span]:
+    """받아쓰기에 없는데 실제로는 말소리가 있는 구간 (리포트 표시용)."""
+    from .audio_energy import loud_regions
+
+    if not words:
+        return []
+    bounds = [(0.0, words[0].start)] + [(a.end, b.start) for a, b in zip(words, words[1:])]
+    bounds.append((words[-1].end, total))
+    out: List[Span] = []
+    for gs, ge in bounds:
+        if ge - gs >= min_len:
+            out.extend(loud_regions(energy, gs + 0.05, ge - 0.05, min_len=min_len))
+    return out
 
 
 def merge_spans(spans: List[Span]) -> List[Span]:
@@ -284,7 +336,15 @@ def detect_cuts(
         gap_min_words=cfg.get("repeat_gap_min_words", 3),
         gap_min_syllables=cfg.get("repeat_gap_min_syllables", 6),
         max_syllable_rate=cfg.get("repeat_max_syllable_rate", 10.0),
+        filler_words=cfg.get("filler_words", []),
     )
+    # AI 검토 컷 안전장치: AI가 '앞선 시도'라며 지우려는 말이 바로 뒤(남는 쪽)에
+    # 실제로 비슷하게 다시 나오지 않으면 지우지 않는다. AI가 남겨야 할 마지막
+    # 테이크까지 지워서 문장이 끊긴 사례가 있었음
+    # ("보증금 문제가 보증금 문제가 해결된 것으로 것을 보입니다" -> "보입니다"만 남음).
+    ai_spans_in = list(ai_spans or [])
+    if ai_spans and cfg.get("ai_require_retake", True):
+        ai_spans = [sp for sp in ai_spans if _retake_follows(words, sp, cfg.get("ai_retake_threshold", 60))]
     ai_spans = ai_spans or []
 
     # 무음 컷은 앞뒤에 진짜 침묵(여유 공간)이 있어서 padding_before/after를
@@ -328,6 +388,8 @@ def detect_cuts(
         "kept_duration": total_duration - total_cut,
         # 리포트용: 말이 들어있는 컷(필러/반복/AI)이 각각 무엇을 잘랐는지
         "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans),
+        "ai_spans_rejected": len(ai_spans_in) - len(ai_spans),
+        "untranscribed": untranscribed_speech(words, energy, total_duration) if energy is not None else [],
     }
     return keep_spans, stats
 

@@ -184,3 +184,26 @@ def test_fill_gaps_recovers_dropped_first_take(tmp_path, monkeypatch):
     assert [w.text.strip() for w in out][:3] == ["고속도로", "접근도", "편합니"]
     spans = find_repeated_phrases(out, 5.0, fuzzy_threshold=80)
     assert spans and spans[0][0] < 1.0 and spans[0][1] < 3.0   # 앞 테이크만 컷
+
+
+def test_stutter_between_takes_is_cut_too():
+    # 실제 리포트 사례: "7월에 법원에 법원의 7월에 법원의 이의신청서"
+    ws = words_of("7월에 법원에 법원의 7월에 법원의 이의신청서와 의견서를 냈고", dur=0.5)
+    spans = find_repeated_phrases(ws, 5.0, fuzzy_threshold=80)
+    assert spans[0] == (ws[0].start, ws[2].end)   # '7월에 법원에 법원의' 통째로
+
+
+def test_ai_span_rejected_when_no_retake_follows():
+    # 실제 리포트 사례: AI가 마지막 테이크까지 지우려 함
+    ws = (words_of("보증금 문제가", start=261.5) + words_of("보증금 문제가 해결된 것으로 것을", start=262.2)
+          + words_of("보입니다 11월에는 201호 유모씨가 다시", start=264.9))
+    cfg = dict(CFG, repeat_window=5.0)
+    _, st = detect_cuts(ws, 300.0, cfg, ai_spans=[(262.17, 264.79)])
+    assert st["ai_spans"] == 0 and st["ai_spans_rejected"] == 1
+
+
+def test_ai_span_kept_when_retake_follows():
+    ws = (words_of("각 방의 취사시설 설치 여부가 대장용도와 맞는지는 확인해", start=139.0)
+          + words_of("각 방에 취사 시설 설치 여부가 대장 용도와 맞는지는 확인해 볼 대목입니다", start=153.0))
+    _, st = detect_cuts(ws, 300.0, dict(CFG, repeat_window=5.0), ai_spans=[(139.0, 143.0)])
+    assert st["ai_spans"] == 1

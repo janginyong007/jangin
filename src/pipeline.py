@@ -38,7 +38,7 @@ from .utils import (
 LogFn = Callable[[str], None]
 
 # 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
-VERSION = "2026-09-27 수정판 4 (빠진 말 다시 받아쓰기)"
+VERSION = "2026-09-27 수정판 5 (고속도로/보증금/7월에 수정)"
 
 
 def run_pipeline(
@@ -116,6 +116,8 @@ def run_pipeline(
                 keep_spans, stats = detect_cuts(
                     words, media.duration, cut_cfg, ai_spans=extra_spans, energy=energy
                 )
+                if stats.get("ai_spans_rejected"):
+                    log(f"      (AI 제안 중 {stats['ai_spans_rejected']}개는 뒤에 다시 말한 게 안 보여서 자르지 않음)")
                 log(
                     f"      최종 검토로 {stats['ai_spans']}개 구간 추가 컷 -> "
                     f"편집본 {stats['kept_duration']:.1f}초 (유지 구간 {stats['keep_spans']}개)"
@@ -249,6 +251,11 @@ def write_cut_report(media_path: str, draft_name: str, stats: dict, words=None, 
             lines.append(f"            바로 뒤 이어지는 말: \"{r['after']}\"")
     if not stats.get("cut_details"):
         lines.append("(말이 들어있는 컷 없음)")
+    if stats.get("untranscribed"):
+        lines += ["", "음성 인식이 받아적지 못했지만 말소리가 있어서 자르지 않고 남긴 곳:",
+                  "  (여기서 반복이 들리면 이 시각을 알려주세요)"]
+        for s_, e_ in stats["untranscribed"]:
+            lines.append(f"[받아쓰기 없음] {_fmt_ts(s_)} ~ {_fmt_ts(e_)}")
 
     if words and keep_spans:
         lines += [
