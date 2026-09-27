@@ -327,9 +327,10 @@ def split_utterances(words: List[Word], energy: Optional["Energy"] = None,
     splits = []  # (다음 호흡 첫 단어 idx, 소리 시작 시각)
     for x in range(len(words) - 1):
         a, b = words[x], words[x + 1]
+        if b.start - a.end >= 0.5:
+            splits.append((x + 1, b.start))
+            continue
         if energy is None:
-            if b.start - a.end >= 0.5:
-                splits.append((x + 1, b.start))
             continue
         fa, fb = energy.frame(a.start), energy.frame((b.start + b.end) / 2)
         quiet = best = best_end = 0
@@ -340,14 +341,24 @@ def split_utterances(words: List[Word], energy: Optional["Energy"] = None,
                     best, best_end = quiet, f + 1
             else:
                 quiet = 0
-        if best * 0.01 < min_pause:
+        # 문장부호(. ? !)나 말끝 흐림(…)으로 끝나는 단어 뒤는 짧은 쉼(0.12초)이어도 나눈다
+        ends_sentence = a.text.strip().endswith((".", "?", "!", "…", "..."))
+        if best * 0.01 < (0.12 if ends_sentence else min_pause):
             continue
         qs, qe = energy.time(best_end - best), energy.time(best_end)
+        if splits and abs(splits[-1][1] - qe) < 0.02:
+            continue  # 바로 앞에서 같은 쉼으로 이미 나눴음 (쉼에 걸친 단어를 다음 호흡으로 보낸 경우)
         # 단어 a가 쉼 구간에 절반 이상 걸쳐 있으면 실제로는 쉼 뒤에 말한 단어로 본다
         a_len = max(a.end - a.start, 1e-3)
         a_in_quiet = max(0.0, min(a.end, qe) - max(a.start, qs))
-        if a_in_quiet >= 0.5 * a_len and x > 0 and (not splits or splits[-1][0] < x):
-            splits.append((x, qe))
+        # 위스퍼가 단어 a를 쉼에 걸쳐 비정상적으로 길게 찍었으면(실제 사례: 0.35초짜리 "다만"을
+        # 1.64초로) a는 쉼 뒤에 말한 것 -> a부터 다음 호흡
+        stretched = a_len > 0.35 * max(1, len(normalize(a.text))) + 0.4 and a.end > qe
+        if (a_in_quiet >= 0.5 * a_len or stretched) and x > 0:
+            if splits and splits[-1][0] == x:
+                splits[-1] = (x, qe)      # 같은 단어 앞에서 이미 나눴으면 소리 시작만 뒤로
+            elif not splits or splits[-1][0] < x:
+                splits.append((x, qe))
         else:
             splits.append((x + 1, max(qe, b.start) if b.start - qe < 0.3 else qe))
     out = []
@@ -360,6 +371,23 @@ def split_utterances(words: List[Word], energy: Optional["Energy"] = None,
     return out
 
 
+def _dedupe_keys(keys: List[str], max_n: int = 4) -> List[str]:
+    """바로 이어 반복된 단어 묶음을 하나로: [이, 숫자, 이, 숫자, 예측치] -> [이, 숫자, 예측치]."""
+    out = list(keys)
+    changed = True
+    while changed:
+        changed = False
+        for n in range(max_n, 0, -1):
+            x = 0
+            while x + 2 * n <= len(out):
+                if out[x:x + n] == out[x + n:x + 2 * n] and any(out[x:x + n]):
+                    del out[x:x + n]
+                    changed = True
+                else:
+                    x += 1
+    return out
+
+
 def find_sentence_retakes(words: List[Word], energy: Optional["Energy"] = None, window: float = 20.0,
                           lookahead: int = 4, head_syllables: int = 10, head_threshold: float = 85.0,
                           min_syllables: int = 6, idx_out: Optional[list] = None) -> List[Span]:
@@ -369,7 +397,8 @@ def find_sentence_retakes(words: List[Word], energy: Optional["Energy"] = None, 
     -> 15초 뒤 "각 방에 취사 시설 설치 여부가 대장 용도와 맞는지는 확인해 볼 대목입니다".
     단어 몇 개 차이의 짧은 반복은 find_repeated_phrases가 맡고, 이건 긴 문장 재시도용."""
     utts = split_utterances(words, energy)
-    texts = ["".join(normalize(w.text) for w in words[a:b]) for a, b, _ in utts]
+    # 비교용 텍스트에서는 문장 안의 버벅임("이 숫자는 이 숫자는")을 한 번으로 줄인다
+    texts = ["".join(_dedupe_keys([_repeat_key(w.text) for w in words[a:b]])) for a, b, _ in utts]
     spans: List[Span] = []
     for u, (a, b, t0) in enumerate(utts):
         tu = texts[u]
