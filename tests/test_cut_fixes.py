@@ -229,3 +229,31 @@ def test_soft_second_take_is_found_as_hole():
     ws = [Word("고속도로", 0.5, 1.2), Word("접근도", 1.2, 2.0), Word("편합니다", 4.5, 5.2)]
     holes = untranscribed_speech(ws, en, 6.0)
     assert any(s <= 3.0 <= e for s, e in holes)
+
+
+def _tone(x, s, dur, amp):
+    t = np.arange(int(dur * SR)) / SR
+    x[int(s * SR):int(s * SR) + len(t)] += amp * np.sin(2 * np.pi * 220 * t)
+
+
+def test_highway_retake_with_untranscribed_second_start():
+    """실제 사례 재현: '지척이라 고속도로 접근도 편합니다. / (고속도로 접근도: 누락) 편합니다.'"""
+    rng = np.random.default_rng(1)
+    x = rng.normal(0, 0.001, int(12 * SR)).astype(np.float32)
+    _tone(x, 1.0, 3.4, 0.3)     # 지척이라 고속도로 접근도 편합니다.  (1.0 ~ 4.4)
+    _tone(x, 5.4, 1.3, 0.02)    # (작은 목소리) 고속도로 접근도       (5.4 ~ 6.7)
+    _tone(x, 6.75, 0.6, 0.3)    # 편합니다.                          (6.75 ~ 7.35)
+    en = energy_from_samples(x, SR)
+    ws = [Word("지척이라", 1.0, 1.7), Word("고속도로", 1.75, 2.5), Word("접근도", 2.55, 3.2),
+          Word("편합니다.", 3.8, 4.4), Word("편합니다.", 6.75, 7.35), Word("대지는", 8.0, 8.6)]
+    keeps, st = detect_cuts(ws, 12.0, dict(CFG, repeat_window=5.0), energy=en)
+    covered = lambda t: any(s <= t <= e for s, e in keeps)
+    assert covered(1.3)                       # '지척이라'는 남김
+    assert not covered(2.0) and not covered(2.9) and not covered(4.0)   # 앞 테이크 통째로 컷
+    assert covered(6.0) and covered(7.0)      # 뒤 테이크(누락된 앞부분 포함)는 남김
+
+
+def test_real_single_word_repeat_with_short_timestamp():
+    # 위스퍼가 두 번째 '편합니다'를 0.38초로 찍어도 진짜 반복으로 인정
+    ws = [Word("편합니다.", 101.71, 102.23), Word("편합니다.", 104.28, 104.66)]
+    assert find_repeated_phrases(ws, 5.0) == [(101.71, 102.23)]

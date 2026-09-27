@@ -151,6 +151,7 @@ def find_repeated_phrases(
     gap_min_syllables: int = 6,
     max_syllable_rate: float = 10.0,
     filler_words: Optional[List[str]] = None,
+    pairs_out: Optional[list] = None,
 ) -> List[Span]:
     """동일 어절(구)이 짧은 시간 안에 반복되면 앞쪽(먼저 말한 쪽)을 컷 후보로 표시.
 
@@ -219,14 +220,18 @@ def find_repeated_phrases(
                         "".join(ngram), "".join(norm[k:min(n, m + 1)]),
                         fuzzy_threshold, fuzzy_min_syllables,
                     )
-                if same and max_syllable_rate > 0 and not (
-                        _plausible_rate(words[i:j], max_syllable_rate)
-                        and _plausible_rate(words[k:m], max_syllable_rate)):
+                # 속도 검사는 '두 테이크 전체 구간'으로 한다. 단어 하나의 시각은 위스퍼가
+                # 짧게 찍는 일이 많아서(실제 "편합니다"가 0.38초로 찍힘) 단어별로 보면
+                # 진짜 반복까지 인식 오류로 오판한다.
+                if same and max_syllable_rate > 0 and not _plausible_rate(
+                        words[i:m], max_syllable_rate):
                     same = False  # 사람이 낼 수 없는 속도 -> 인식 오류로 보고 자르지 않음
                 if same:
                     # 사이에 낀 게 버벅임이면 그것까지, 새 맥락(도입구)이면 그 앞까지만 자른다
                     end_word = words[k - 1] if junk_gap else words[j - 1]
                     spans.append((words[i].start, end_word.end))
+                    if pairs_out is not None:
+                        pairs_out.append((i, j, k))
                     i = k
                     matched = True
                     break
@@ -255,6 +260,52 @@ def _retake_follows(words: List[Word], span: Span, threshold: float, lookahead: 
         if best >= threshold:
             return True
     return False
+
+
+def retake_start_in_hole(words: List[Word], pairs, energy: "Energy",
+                         min_hole: float = 0.4, max_pause: float = 0.35) -> List[Span]:
+    """반복 뒤쪽 테이크 바로 앞에 '받아적지 못한 말소리'가 있으면, 그 말소리는 다시 말한
+    테이크의 앞부분일 가능성이 높다. 그만큼 앞 테이크도 더 앞에서부터 잘라야 한다.
+
+    실제 사례: "고속도로 접근도 편합니… / (고속도로 접근도: 받아쓰기 누락) 편합니다"
+    -> "편합니다"끼리만 반복으로 잡혀서 앞 테이크의 "고속도로 접근도"가 남고 반복이 들림.
+    빈 곳의 말소리 길이와 가장 비슷한 만큼 앞 테이크 쪽 단어를 거슬러 올라가 자른다."""
+    from .audio_energy import loud_regions, soft_speech_level
+
+    extra: List[Span] = []
+    for i, j, k in pairs:
+        if k != j or i == 0:
+            continue  # 두 테이크 사이에 받아적힌 말이 있으면 해당 없음
+        gs, ge = words[j - 1].end, words[k].start
+        regs = loud_regions(energy, gs + 0.05, ge + 0.05, min_len=0.25, level=soft_speech_level(energy))
+        if not regs:
+            continue
+        hs, he = regs[0][0], regs[-1][1]
+        if he < ge - 0.4 or he - hs < min_hole:
+            continue  # 뒤 테이크 바로 앞에 붙어있는 말소리만
+        hole = he - hs
+        # 앞 테이크 시작(words[i]) 이전 단어들을 쉼 없이 이어진 만큼 거슬러 올라가며
+        # 누적 길이가 빈 곳 길이와 가장 비슷한 지점을 찾는다 (같으면 적게 자르는 쪽)
+        best_c, best_diff, acc = 0, hole, 0.0
+        x = i
+        def continuous(a: Word, b: Word) -> bool:
+            # 위스퍼 단어 시각은 부정확하니, 두 단어 사이가 실제로 조용했는지 소리로 판단
+            if b.start - a.end <= max_pause:
+                return True
+            fa, fb = energy.frame(a.end), energy.frame(b.start)
+            seg = energy.db[fa:fb]
+            return len(seg) > 0 and float((seg >= energy.speech_off).mean()) >= 0.6
+
+        while x > 0 and continuous(words[x - 1], words[x]):
+            x -= 1
+            acc += words[x].end - words[x].start  # 단어 사이 쉼은 빼고 말한 길이만
+            if acc > hole * 1.5:
+                break
+            if abs(acc - hole) < best_diff - 0.05:
+                best_c, best_diff = i - x, abs(acc - hole)
+        if best_c and best_diff <= hole * 0.5:
+            extra.append((words[i - best_c].start, words[i].start))
+    return extra
 
 
 def untranscribed_speech(words: List[Word], energy: "Energy", total: float, min_len: float = 0.4) -> List[Span]:
@@ -346,6 +397,7 @@ def detect_cuts(
     보정해서 말끝/첫소리가 잘리지 않게 한다. 없으면 기존처럼 위스퍼 시각만 쓴다."""
     silence_spans = find_silence_gaps(words, total_duration, cfg["silence_min_gap"])
     filler_spans = find_filler_words(words, cfg["filler_words"], cfg["filler_max_duration"])
+    pairs: list = []
     repeat_spans = find_repeated_phrases(
         words,
         cfg["repeat_window"],
@@ -357,7 +409,11 @@ def detect_cuts(
         gap_min_syllables=cfg.get("repeat_gap_min_syllables", 6),
         max_syllable_rate=cfg.get("repeat_max_syllable_rate", 10.0),
         filler_words=cfg.get("filler_words", []),
+        pairs_out=pairs,
     )
+    hole_spans: List[Span] = []
+    if energy is not None and cfg.get("retake_hole_extend", True):
+        hole_spans = retake_start_in_hole(words, pairs, energy)
     # AI 검토 컷 안전장치: AI가 '앞선 시도'라며 지우려는 말이 바로 뒤(남는 쪽)에
     # 실제로 비슷하게 다시 나오지 않으면 지우지 않는다. AI가 남겨야 할 마지막
     # 테이크까지 지워서 문장이 끊긴 사례가 있었음
@@ -377,7 +433,7 @@ def detect_cuts(
     # 그래서 필러/반복/AI 컷에는 훨씬 작은 padding만 준다.
     silence_padded = shrink_spans(merge_spans(silence_spans), cfg["padding_before"], cfg["padding_after"])
     content_padded = shrink_spans(
-        merge_spans(filler_spans + repeat_spans + ai_spans),
+        merge_spans(filler_spans + repeat_spans + hole_spans + ai_spans),
         cfg.get("content_padding_before", 0.05),
         cfg.get("content_padding_after", 0.05),
     )
@@ -407,7 +463,7 @@ def detect_cuts(
         "total_cut_seconds": total_cut,
         "kept_duration": total_duration - total_cut,
         # 리포트용: 말이 들어있는 컷(필러/반복/AI)이 각각 무엇을 잘랐는지
-        "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans),
+        "cut_details": _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans),
         "ai_spans_rejected": len(ai_spans_in) - len(ai_spans),
         "untranscribed": untranscribed_speech(words, energy, total_duration) if energy is not None else [],
     }
@@ -419,9 +475,10 @@ def _words_in(words: List[Word], s: float, e: float) -> str:
                    for w in words if s - 0.01 <= (w.start + w.end) / 2 <= e + 0.01).strip()
 
 
-def _cut_details(words, filler_spans, repeat_spans, ai_spans) -> List[dict]:
+def _cut_details(words, filler_spans, repeat_spans, ai_spans, hole_spans=()) -> List[dict]:
     rows = []
-    for kind, spans in (("필러워드", filler_spans), ("반복발화", repeat_spans), ("AI검토", ai_spans)):
+    for kind, spans in (("필러워드", filler_spans), ("반복발화", repeat_spans), ("AI검토", ai_spans),
+                        ("반복발화-추정(뒤 테이크 앞부분이 받아쓰기 누락)", hole_spans)):
         for s, e in spans:
             rows.append({
                 "kind": kind, "start": s, "end": e,

@@ -38,7 +38,7 @@ from .utils import (
 LogFn = Callable[[str], None]
 
 # 업데이트가 실제로 적용됐는지 로그 첫 줄에서 바로 확인할 수 있게 표시한다.
-VERSION = "2026-09-27 수정판 6 (작은 목소리 재시도 잡기)"
+VERSION = "2026-09-27 수정판 7 (고속도로 재시도/지어낸 말 제거)"
 
 
 def run_pipeline(

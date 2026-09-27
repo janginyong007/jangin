@@ -143,7 +143,7 @@ def _refine_long_words(words: List[Word], wav_path: str, model: "WhisperModel", 
 
 
 # 전사 방식이 바뀌면 올려서 예전 캐시(반복이 합쳐진 결과)를 다시 쓰지 않게 한다.
-_TRANSCRIBE_VERSION = "verbatim-5"
+_TRANSCRIBE_VERSION = "verbatim-6"
 
 # 위스퍼는 앞 문맥을 보고 말을 매끄럽게 '정리'해서, 두 번 반복한 말을 한 번으로
 # 합쳐 받아적는 경향이 있다 (그러면 텍스트에 반복이 안 남아 반복 감지가 불가능).
@@ -210,12 +210,18 @@ def _fill_transcript_gaps(words: List[Word], wav_path: str, model, language: str
     for rs, re_ in holes:
         # 1) 빈 곳만 따로  2) 앞 문장을 힌트로 주고 빈 곳만  3) 앞뒤 문맥까지 같이
         # (문맥을 같이 주면 위스퍼가 '같은 말 반복'을 또 건너뛸 수 있어서 마지막에 시도)
-        before = " ".join(w.text.strip() for w in words if w.end <= rs)[-60:]
+        # (앞 문장을 힌트로 주는 방법은 위스퍼가 힌트를 그대로 베껴 쓰는 문제가 있어서
+        #  - 실제로 "5개씩 있습니다."를 한 번 더 지어냄 - 쓰지 않는다)
         got = attempt(rs, re_, max(0.0, rs - 0.3), re_ + 0.3)
-        if not got and before:
-            got = attempt(rs, re_, max(0.0, rs - 0.3), re_ + 0.3, prompt=before)
         if not got:
             got = attempt(rs, re_, max(0.0, rs - 2.0), re_ + 1.5)
+        # 빈 곳 길이에 비해 말이 너무 많으면(사람이 낼 수 없는 속도) 지어낸 것으로 본다
+        # (실제로 0.2초 구간에 "스토리였습니다"를 지어낸 사례)
+        got = [w for w in got if w.end - w.start >= 0.05]
+        if got:
+            syl = sum(1 for w in got for ch in w.text if "가" <= ch <= "힣")
+            if syl / max(re_ - rs, 0.1) > 9.0:
+                got = []
         if got:
             print(f"[transcribe]   {rs:.1f}초: " + " ".join(w.text.strip() for w in got))
         added.extend(got)
